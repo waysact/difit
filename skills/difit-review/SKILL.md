@@ -48,6 +48,8 @@ The detailed procedure is as follows.
   - Never copy secrets, tokens, passwords, API keys, private keys, or other credential-like material from the diff into `--comment` bodies or any command-line arguments.
 - **Additional argument for files not yet added to git**
   - For uncommitted changes, if you decide files not yet added to git should also appear in the diff, add `--include-untracked`.
+- **Window title**
+  - If more than one review session might be open at once, add `--title` with something that identifies this one — the task, branch, PR, or repository — so the user can tell the difit tabs apart.
 
 3. Share the difit URL and finish the response.
    - If there were no comments to attach, explicitly say so.

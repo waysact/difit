@@ -59,6 +59,14 @@ For uncommitted changes, if files not yet added to git should also appear in the
 <difit-command> . --include-untracked
 ```
 
+## Optional Window Title
+
+If more than one difit session might be open in the browser at the same time, set `--title` to something that identifies this one — the task, branch, or repository — so the user can tell the tabs apart.
+
+```bash
+<difit-command> <target> [compare-with] --title "Fix auth timeout bug"
+```
+
 ## Constraints
 
 Can only be used inside a Git-managed directory.
