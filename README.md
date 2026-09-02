@@ -156,6 +156,7 @@ Stdin mode is selected with intent-first rules:
 | `--keep-alive`        | false           | Keep server running after browser disconnects (stop manually with Ctrl+C)                               |
 | `--background`        | false           | Keep the server running in the background and output JSON connection info                               |
 | `--context <lines>`   | git default (3) | Limit surrounding context lines per change (`0` shows changes only; not available with `--pr` or stdin) |
+| `--title <title>`     | -               | Custom window title for the browser tab                                                                 |
 
 ## 💬 Comment System
 
