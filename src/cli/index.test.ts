@@ -230,6 +230,11 @@ describe('CLI index.ts', () => {
         args: ['--merge-base'],
         expectedOptions: { mergeBase: true },
       },
+      {
+        name: '--title option',
+        args: ['--title', 'My Custom Title'],
+        expectedOptions: { title: 'My Custom Title' },
+      },
     ])('$name', async ({ args, expectedOptions }) => {
       mockFindUntrackedFiles.mockResolvedValue([]);
 
@@ -246,6 +251,7 @@ describe('CLI index.ts', () => {
         .option('--clean', 'start with a clean slate by clearing all existing comments')
         .option('--keep-alive', 'keep server running even after browser disconnects')
         .option('--context <lines>', 'context', parseInt)
+        .option('--title <title>', 'title')
         .action(async (commitish: string, _compareWith: string | undefined, options: any) => {
           let targetCommitish = commitish;
           let baseCommitish = commitish + '^';
@@ -260,6 +266,7 @@ describe('CLI index.ts', () => {
             clearComments: options.clean,
             keepAlive: options.keepAlive,
             contextLines: options.context,
+            title: options.title,
           });
         });
 
@@ -275,6 +282,7 @@ describe('CLI index.ts', () => {
         clearComments: expectedOptions.clean,
         keepAlive: expectedOptions.keepAlive,
         contextLines: expectedOptions.context,
+        title: expectedOptions.title,
       };
 
       expect(mockStartServer).toHaveBeenCalledWith(expectedCall);
