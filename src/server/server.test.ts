@@ -1,8 +1,8 @@
 import { promises as fs } from 'fs';
-import { tmpdir } from 'os';
+import { networkInterfaces, tmpdir } from 'os';
 import { join } from 'path';
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 
 // Set environment variable to skip fetch mocking
 process.env.VITEST_SERVER_TEST = 'true';
@@ -14,6 +14,14 @@ import type { CommentImport } from '../types/diff.js';
 const { fetch } = await import('undici');
 globalThis.fetch = fetch as any;
 const parserInstances = vi.hoisted(() => [] as any[]);
+
+// `host: '::1'` fails `listen` with EADDRNOTAVAIL on a host without IPv6, so the
+// one test that binds to it is skipped there instead of being flaky.
+function hasIPv6Loopback(): boolean {
+  return Object.values(networkInterfaces()).some((addresses) =>
+    addresses?.some((address) => address.family === 'IPv6' && address.address === '::1'),
+  );
+}
 
 // Helper function to get available port
 async function getAvailablePort(preferredPort: number): Promise<number> {
@@ -373,6 +381,16 @@ describe('Server Integration Tests', () => {
   });
 
   describe('Server startup', () => {
+    let warnSpy: MockInstance<typeof console.warn>;
+
+    beforeEach(() => {
+      warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warnSpy.mockRestore();
+    });
+
     it('starts on preferred port', async () => {
       // Use a high port number to avoid conflicts
       const preferredPort = 9000;
@@ -420,6 +438,58 @@ describe('Server Integration Tests', () => {
 
       expect(result.url).toContain('http://localhost:'); // Display host conversion
     });
+
+    it('warns that open-in-editor is disabled when bound off-loopback', async () => {
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '0.0.0.0',
+        preferredPort: 9021,
+      });
+      servers.push(result.server);
+
+      const warnedLines = warnSpy.mock.calls.map((call) => call[0]);
+      expect(
+        warnedLines.some(
+          (line) => typeof line === 'string' && line.includes('accessible from external network'),
+        ),
+      ).toBe(true);
+      expect(
+        warnedLines.some(
+          (line) =>
+            typeof line === 'string' &&
+            line.includes('Open in editor is disabled while bound off-loopback.'),
+        ),
+      ).toBe(true);
+    });
+
+    it('does not warn when bound to 127.1, an abbreviated form that resolves to loopback', async () => {
+      // net.isIP rejects "127.1", but Node's listen() falls through to
+      // getaddrinfo, which expands it to 127.0.0.1 and binds loopback-only.
+      // The warning must read the OS-resolved bind address, not the raw
+      // --host string, or it wrongly claims external accessibility here.
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.1',
+        preferredPort: 9023,
+      });
+      servers.push(result.server);
+
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it.runIf(hasIPv6Loopback())(
+      'does not warn when bound to ::1, a loopback address the old ad-hoc check missed',
+      async () => {
+        const result = await startServer({
+          selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+          host: '::1',
+          preferredPort: 9022,
+        });
+        servers.push(result.server);
+
+        expect(warnSpy).not.toHaveBeenCalled();
+      },
+    );
 
     it('passes context lines to the initial diff load', async () => {
       const result = await startServer({
@@ -1728,6 +1798,251 @@ describe('Server Integration Tests', () => {
       const response2 = await fetch(`http://localhost:${port}/api/diff?ignoreWhitespace=true`);
       const data2 = (await response2.json()) as any;
       expect(data2.clearComments).toBe(true);
+    });
+  });
+
+  describe('open-in-editor guards', () => {
+    // These tests assert rejection before `spawn` is ever reached, so the exact
+    // command is irrelevant to what is being tested. It is deliberately a path
+    // that cannot exist: if a guard regresses and this fixture actually reaches
+    // `spawn`, the process fails to launch instead of executing a real command.
+    const editorBody = {
+      filePath: 'README.md',
+      line: 1,
+      editor: {
+        id: 'vscode',
+        command: '/nonexistent/difit-guard-test-should-never-run',
+        argsTemplate: '-c id',
+      },
+    };
+
+    // Anyone with DIFIT_EDITOR or EDITOR exported in their shell would otherwise
+    // see the env-guard rejection instead of the message a given test expects.
+    // Start every test from a known, unset state; tests that need a value set
+    // stub it themselves afterwards.
+    beforeEach(() => {
+      vi.stubEnv('DIFIT_EDITOR', undefined);
+      vi.stubEnv('EDITOR', undefined);
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('refuses to spawn when the server is bound beyond loopback', async () => {
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '0.0.0.0',
+        preferredPort: 9100,
+      });
+      servers.push(server);
+
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled when the server is not bound to loopback',
+      );
+    });
+
+    it('still allows the request when bound to loopback', async () => {
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9101,
+      });
+      servers.push(server);
+
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: 'README.md', line: 1, editor: { id: 'none' } }),
+      });
+
+      // 'none' is still rejected, but with the disabled-editor error rather than the
+      // loopback error — proving the loopback guard did not fire.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty('error', 'Open in editor is disabled');
+    });
+
+    it('still allows the request when --host is an abbreviated form that resolves to loopback', async () => {
+      // net.isIP rejects "127.1", but listen() resolves it to 127.0.0.1 via
+      // getaddrinfo and binds loopback-only. The guard must read the
+      // OS-resolved bind address, not the raw --host string, or it wrongly
+      // refuses this request.
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.1',
+        preferredPort: 9108,
+      });
+      servers.push(server);
+
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: 'README.md', line: 1, editor: { id: 'none' } }),
+      });
+
+      // 'none' is still rejected, but with the disabled-editor error rather than the
+      // loopback error — proving the loopback guard did not fire.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty('error', 'Open in editor is disabled');
+    });
+
+    it('honours DIFIT_EDITOR=none even when the caller supplies another editor id', async () => {
+      vi.stubEnv('DIFIT_EDITOR', 'none');
+
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9102,
+      });
+      servers.push(server);
+
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled by DIFIT_EDITOR=none',
+      );
+    });
+
+    it('honours EDITOR=none even when the caller supplies another editor id', async () => {
+      vi.stubEnv('DIFIT_EDITOR', undefined);
+      vi.stubEnv('EDITOR', 'none');
+
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9103,
+      });
+      servers.push(server);
+
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      // Asserts the distinct EDITOR message, not just any 403, so this pins the
+      // EDITOR guard rather than the loopback or DIFIT_EDITOR guard.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled by EDITOR=none',
+      );
+    });
+
+    it('falls back to EDITOR=none when DIFIT_EDITOR is an empty string', async () => {
+      vi.stubEnv('DIFIT_EDITOR', '');
+      vi.stubEnv('EDITOR', 'none');
+
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9104,
+      });
+      servers.push(server);
+
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      // An empty DIFIT_EDITOR must not be treated as "set", or it would mask
+      // EDITOR=none and let the request fall through to a real spawn.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled by EDITOR=none',
+      );
+    });
+
+    it('falls back to EDITOR=none when DIFIT_EDITOR is whitespace only', async () => {
+      vi.stubEnv('DIFIT_EDITOR', '   ');
+      vi.stubEnv('EDITOR', 'none');
+
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9105,
+      });
+      servers.push(server);
+
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      // Same as the empty-string case: whitespace-only must also count as unset.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled by EDITOR=none',
+      );
+    });
+
+    it('does not let a real DIFIT_EDITOR value be blocked by EDITOR=none', async () => {
+      vi.stubEnv('DIFIT_EDITOR', 'vscode');
+      vi.stubEnv('EDITOR', 'none');
+
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9106,
+      });
+      servers.push(server);
+
+      // A non-blank DIFIT_EDITOR must win over EDITOR, so the env guard must not
+      // fire here. To prove that without ever reaching `spawn`, the body carries
+      // an invalid filePath: the next check the handler runs after the env guard
+      // rejects it with a distinct 400, which could only be reached if the env
+      // guard let the request through.
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: 123 }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toHaveProperty('error', 'Invalid request payload');
+    });
+
+    it('passes a legitimate loopback request all the way through to the spawn attempt', async () => {
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9107,
+      });
+      servers.push(server);
+
+      const response = await fetch(`http://localhost:${port}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      // No guard fires: no DIFIT_EDITOR/EDITOR is set, the host is loopback, and the
+      // request supplies a valid filePath and editor. The 500 below comes only from
+      // the fixture command failing to spawn (it doesn't exist), which proves the
+      // request reached the real spawn attempt without ever executing anything.
+      expect(response.status).toBe(500);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Failed to launch editor: command "/nonexistent/difit-guard-test-should-never-run" is not available on PATH',
+      );
     });
   });
 });
