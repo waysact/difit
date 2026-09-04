@@ -175,6 +175,43 @@ export function parseCommentOptions(commentValues: string[]): CommentImport[] {
   return commentValues.flatMap((value) => parseCommentImportValue(value));
 }
 
+/**
+ * Largest `--idle-grace <seconds>` value whose millisecond form still fits
+ * `setTimeout`'s 32-bit signed delay limit (2147483647 ms). Above this,
+ * Node clamps the delay to 1 ms: the idle timer fires almost immediately,
+ * `ReviewLifecycle.stateAt()` correctly reports the grace period as not yet
+ * elapsed, and nothing ever reschedules the timer, so the server never
+ * exits — the same failure mode the `NaN` check below guards against.
+ */
+export const MAX_IDLE_GRACE_SECONDS = 2_147_483;
+
+/**
+ * Validates a parsed `--idle-grace <seconds>` value.
+ *
+ * `parseInt` turns a typo like `--idle-grace abc` into `NaN`. `??` does not
+ * catch `NaN`, so it would reach `ReviewLifecycle` unvalidated: `x >= NaN` is
+ * always `false`, so the review can never be reported terminal and the
+ * server never exits. Reject anything that is not a non-negative integer,
+ * or that exceeds `MAX_IDLE_GRACE_SECONDS`, before it gets that far.
+ */
+export function validateIdleGraceSeconds(value: number | undefined): {
+  valid: boolean;
+  error?: string;
+} {
+  if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+    return { valid: false, error: '--idle-grace must be a non-negative integer' };
+  }
+
+  if (value !== undefined && value > MAX_IDLE_GRACE_SECONDS) {
+    return {
+      valid: false,
+      error: `--idle-grace must be at most ${MAX_IDLE_GRACE_SECONDS} seconds`,
+    };
+  }
+
+  return { valid: true };
+}
+
 export function validateDiffArguments(
   targetCommitish: string,
   baseCommitish?: string,

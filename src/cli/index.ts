@@ -16,6 +16,7 @@ import {
   promptUser,
   parseCommentOptions,
   validateDiffArguments,
+  validateIdleGraceSeconds,
   getGitRoot,
   readStdin,
 } from './utils.js';
@@ -90,6 +91,7 @@ interface CliOptions {
   background?: boolean;
   context?: number;
   mergeBase?: boolean;
+  idleGrace?: number;
 }
 
 const program = new Command();
@@ -122,6 +124,11 @@ program
   .option('--clean', 'start with a clean slate by clearing all existing comments')
   .option('--include-untracked', 'automatically include untracked files in diff')
   .option('--keep-alive', 'keep server running even after browser disconnects')
+  .option(
+    '--idle-grace <seconds>',
+    'seconds with no connected browser before the review is treated as finished',
+    parseInt,
+  )
   .option('--background', 'keep the server running in the background and output JSON info')
   .option('--context <lines>', 'number of context lines shown around each change', parseInt)
   .option(
@@ -142,6 +149,12 @@ program
         (!Number.isInteger(options.context) || options.context < 0)
       ) {
         console.error('Error: --context must be a non-negative integer');
+        process.exit(1);
+      }
+
+      const idleGraceValidation = validateIdleGraceSeconds(options.idleGrace);
+      if (!idleGraceValidation.valid) {
+        console.error(`Error: ${idleGraceValidation.error}`);
         process.exit(1);
       }
 
@@ -298,6 +311,7 @@ program
         diffMode: determineDiffMode(selection, compareWith),
         repoPath,
         ...(commentImports.length > 0 ? { commentImports } : {}),
+        ...(options.idleGrace === undefined ? {} : { idleGraceMs: options.idleGrace * 1000 }),
       });
 
       if (backgroundMode) {
