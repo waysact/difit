@@ -1035,8 +1035,12 @@ function App() {
     };
 
     eventSource.onerror = () => {
-      console.log('Server connection lost');
-      eventSource.close();
+      // Deliberately do NOT close: closing disables EventSource's built-in retry,
+      // and one transient drop would then make a live tab look permanently gone to
+      // the server's idle detection. useFileWatch hand-rolls reconnection for
+      // /api/watch with a five-attempt cap; that cap is a separate defect and is
+      // not copied here.
+      console.log('Server connection lost; browser will retry');
     };
 
     // Cleanup on unmount
