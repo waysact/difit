@@ -115,6 +115,40 @@ export const resolveEditorOption = (input?: string): EditorOption => {
 };
 
 /**
+ * Resolves the effective editor id from the environment, encoding the
+ * `DIFIT_EDITOR` takes priority over `EDITOR` rule exactly once. The server's
+ * open-in-editor guard and its editor-id resolution both call this instead of
+ * each re-deriving that precedence, so the two cannot drift apart.
+ *
+ * A blank or whitespace-only value counts as unset, so `DIFIT_EDITOR=""` (or
+ * `"   "`) does not mask a real `EDITOR` value — `EDITOR=none` included.
+ *
+ * `env` defaults to `process.env`, but takes it as a parameter so this is
+ * unit-testable without `vi.stubEnv`.
+ */
+export function resolveEnvEditor(env: NodeJS.ProcessEnv = process.env): {
+  id: string | undefined;
+  source: 'DIFIT_EDITOR' | 'EDITOR' | undefined;
+} {
+  const blankToUndefined = (value: string | undefined): string | undefined => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+  };
+
+  const difitEditor = blankToUndefined(env.DIFIT_EDITOR);
+  if (difitEditor !== undefined) {
+    return { id: difitEditor, source: 'DIFIT_EDITOR' };
+  }
+
+  const editor = blankToUndefined(env.EDITOR);
+  if (editor !== undefined) {
+    return { id: editor, source: 'EDITOR' };
+  }
+
+  return { id: undefined, source: undefined };
+}
+
+/**
  * Tokenise a user-supplied arguments template string into individual CLI
  * arguments. Supports single and double quoted segments so paths and flags
  * containing spaces can be preserved.
