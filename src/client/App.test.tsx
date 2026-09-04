@@ -513,6 +513,43 @@ describe('App Component - Heartbeat Connection', () => {
       expect(MockEventSource.instances[0]?.url).toBe('http://localhost:4969/api/heartbeat');
     });
   });
+
+  it('lets the browser reconnect the heartbeat after a transport error', async () => {
+    renderApp();
+
+    await waitFor(() => {
+      expect(
+        MockEventSource.instances.some((instance) => instance.url.includes('/api/heartbeat')),
+      ).toBe(true);
+    });
+
+    const heartbeat = MockEventSource.instances.find((instance) =>
+      instance.url.includes('/api/heartbeat'),
+    );
+    expect(heartbeat).toBeDefined();
+
+    // A mock EventSource cannot exhibit the browser's real retry behaviour, so this
+    // does not prove a reconnection happens. What it does prove: our error handler no
+    // longer calls close(), which is the exact thing that disabled EventSource's
+    // built-in retry before this fix; and that, unlike useFileWatch's hand-rolled
+    // reconnect for /api/watch (a setTimeout of 3000ms), no replacement EventSource
+    // appears even after time well past that delay has elapsed.
+    vi.useFakeTimers();
+    try {
+      heartbeat?.onerror?.(new Event('error'));
+
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+
+      expect(heartbeat?.close).not.toHaveBeenCalled();
+      expect(
+        MockEventSource.instances.filter((instance) => instance.url.includes('/api/heartbeat')),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('App Component - Initial file collapsing', () => {

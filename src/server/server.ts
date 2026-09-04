@@ -27,6 +27,7 @@ import { getFileExtension } from '../utils/fileUtils.js';
 
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
+import { ReviewLifecycle } from './review-lifecycle.js';
 import { parseUserSettingsPatch, readUserConfig, updateUserClientSettings } from './user-config.js';
 
 import {
@@ -56,6 +57,8 @@ interface ServerOptions {
   clearComments?: boolean;
   commentImports?: CommentImport[];
   keepAlive?: boolean;
+  /** Milliseconds with zero heartbeat clients before the review counts as idle. */
+  idleGraceMs?: number;
   diffMode?: DiffMode;
   repoPath?: string;
   contextLines?: number;
@@ -245,6 +248,10 @@ export async function startServer(
       argsTemplate: typeof candidate.argsTemplate === 'string' ? candidate.argsTemplate : undefined,
     };
   }
+
+  const idleGraceMs = options.idleGraceMs ?? 10_000;
+  const lifecycle = new ReviewLifecycle(idleGraceMs);
+  let idleTimer: NodeJS.Timeout | null = null;
 
   const commentSessions = new Map<string, CommentSessionState>();
   const initialCommentThreads = mergeCommentImports([], initialCommentImports).threads;
@@ -998,24 +1005,41 @@ export async function startServer(
       res.write('data: heartbeat\n\n');
     }, 5000);
 
-    // When client disconnects (tab closed, navigation, etc.)
+    lifecycle.onConnect(new Date());
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+
     req.on('close', () => {
       clearInterval(heartbeatInterval);
-      if (options.keepAlive) {
-        console.log('Client disconnected, but server is staying alive (--keep-alive)');
-        console.log('Press Ctrl+C to stop the server');
-      } else {
-        // Add a small delay to ensure any pending sendBeacon requests are processed
-        setTimeout(async () => {
-          console.log('Client disconnected, shutting down server...');
+      lifecycle.onDisconnect(new Date());
 
-          // Stop file watcher
+      if (lifecycle.stateAt(new Date()).clients > 0) {
+        return;
+      }
+
+      // Re-ask the lifecycle once the grace period has had time to elapse, rather
+      // than assuming this close was the last one. A reload passes through zero.
+      idleTimer = setTimeout(() => {
+        idleTimer = null;
+        if (!lifecycle.stateAt(new Date()).terminal) {
+          return;
+        }
+
+        if (options.keepAlive) {
+          console.log('Review went idle, but the server is staying alive (--keep-alive)');
+          console.log('Press Ctrl+C to stop the server');
+          return;
+        }
+
+        void (async () => {
+          console.log('Review went idle, shutting down server...');
           await fileWatcher.stop();
-
           outputFinalComments();
           process.exit(0);
-        }, 100);
-      }
+        })();
+      }, idleGraceMs).unref();
     });
   });
 
@@ -1052,6 +1076,15 @@ export async function startServer(
     options.preferredPort || 4966,
     options.host || 'localhost',
   );
+
+  // Guard against the idle-shutdown timer outliving this server: clear it on
+  // close so a stray fire can never reach a torn-down server.
+  server.on('close', () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  });
 
   // Security warning for non-localhost binding
   if (options.host && options.host !== '127.0.0.1' && options.host !== 'localhost') {

@@ -1579,6 +1579,7 @@ describe('Server Integration Tests', () => {
       const { port, server } = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         keepAlive: true,
+        idleGraceMs: 50,
         preferredPort: 9070,
       });
       servers.push(server);
@@ -1602,7 +1603,7 @@ describe('Server Integration Tests', () => {
       // Disconnect by aborting
       controller.abort();
 
-      // Wait for the server's close handler + setTimeout(100ms) to run
+      // Wait for the grace period to actually elapse plus the server's close handler
       await new Promise((resolve) => setTimeout(resolve, 300));
 
       // With keepAlive, process.exit should NOT have been called
@@ -1613,6 +1614,7 @@ describe('Server Integration Tests', () => {
       const { port, server } = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         keepAlive: false,
+        idleGraceMs: 50,
         preferredPort: 9080,
       });
       servers.push(server);
@@ -1640,6 +1642,45 @@ describe('Server Integration Tests', () => {
 
       // Without keepAlive, process.exit SHOULD have been called
       expect(process.exit).toHaveBeenCalledWith(0);
+    });
+
+    it('does not exit while a second heartbeat client is still connected', async () => {
+      const { port, server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        keepAlive: false,
+        idleGraceMs: 50,
+        preferredPort: 9090,
+      });
+      servers.push(server);
+
+      const first = new AbortController();
+      const second = new AbortController();
+
+      const openHeartbeat = async (controller: AbortController): Promise<void> => {
+        const response = await fetch(`http://localhost:${port}/api/heartbeat`, {
+          signal: controller.signal,
+        }).catch(() => null);
+        const reader = response?.body?.getReader();
+        if (reader) {
+          await reader.read();
+        }
+      };
+
+      await openHeartbeat(first);
+      await openHeartbeat(second);
+
+      first.abort();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      expect(process.exit).not.toHaveBeenCalled();
+
+      // Close the still-open second connection so the shared afterEach's
+      // server.close() (which waits for all connections to end) doesn't hang.
+      // Wait out the grace period here too, while process.exit is still
+      // mocked, so the resulting shutdown doesn't fire after afterEach
+      // restores the real process.exit.
+      second.abort();
+      await new Promise((resolve) => setTimeout(resolve, 300));
     });
   });
 

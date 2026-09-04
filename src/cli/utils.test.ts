@@ -2,11 +2,13 @@ import { describe, it, expect } from 'vitest';
 
 import {
   detectStdinSource,
+  MAX_IDLE_GRACE_SECONDS,
   parseCommentOptions,
   shortHash,
   shouldReadStdin,
   validateCommitish,
   validateDiffArguments,
+  validateIdleGraceSeconds,
 } from './utils';
 
 describe('CLI Utils', () => {
@@ -433,6 +435,49 @@ describe('CLI Utils', () => {
         expect(validateDiffArguments('a1b2c3d4e5f6789012345678901234567890abcd^', 'HEAD')).toEqual({
           valid: true,
         });
+      });
+    });
+  });
+
+  describe('validateIdleGraceSeconds', () => {
+    it('accepts undefined, meaning --idle-grace was not given', () => {
+      expect(validateIdleGraceSeconds(undefined)).toEqual({ valid: true });
+    });
+
+    it('accepts zero and other non-negative integers', () => {
+      expect(validateIdleGraceSeconds(0)).toEqual({ valid: true });
+      expect(validateIdleGraceSeconds(30)).toEqual({ valid: true });
+    });
+
+    it('rejects NaN, which is what a typo like "--idle-grace abc" parses to', () => {
+      expect(validateIdleGraceSeconds(NaN)).toEqual({
+        valid: false,
+        error: '--idle-grace must be a non-negative integer',
+      });
+    });
+
+    it('rejects negative values', () => {
+      expect(validateIdleGraceSeconds(-1)).toEqual({
+        valid: false,
+        error: '--idle-grace must be a non-negative integer',
+      });
+    });
+
+    it('rejects non-integer values', () => {
+      expect(validateIdleGraceSeconds(1.5)).toEqual({
+        valid: false,
+        error: '--idle-grace must be a non-negative integer',
+      });
+    });
+
+    it("accepts the largest value whose millisecond form still fits setTimeout's 32-bit delay", () => {
+      expect(validateIdleGraceSeconds(MAX_IDLE_GRACE_SECONDS)).toEqual({ valid: true });
+    });
+
+    it("rejects the smallest value whose millisecond form overflows setTimeout's 32-bit delay", () => {
+      expect(validateIdleGraceSeconds(MAX_IDLE_GRACE_SECONDS + 1)).toEqual({
+        valid: false,
+        error: `--idle-grace must be at most ${MAX_IDLE_GRACE_SECONDS} seconds`,
       });
     });
   });
