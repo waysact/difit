@@ -62,7 +62,8 @@ All are under `apiUrl`, all require `X-Difit-Session: <sessionId>`, and all are
 
 `session` carries the review's identity and state: `sessionId`, `state` (`active` or `finished`),
 `reason`, `cursor`, `finishedCursor`, `finishedAt`, `cleanupAt`, `publicUrl`, `apiUrl`, `port`,
-`pid`, `limits` (`idleGraceMs`, `timeoutMs`, `cleanupGraceMs`), and `selection` /`selectionKey`
+`pid`, `limits` (`idleGraceMs`, `timeoutMs`, `cleanupGraceMs`; `timeoutMs` is `null` only for a
+foreground launch without `--timeout`, never for a background review), and `selection` /`selectionKey`
 describing the revisions under review.
 
 **The agent routes are pinned to the launch selection.** If the person browses a different

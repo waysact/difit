@@ -366,7 +366,9 @@ export async function startServer(options: ServerOptions): Promise<{
 
   const idleGraceMs = options.idleGraceMs ?? 10_000;
   const backgroundReview = options.backgroundReview ?? false;
-  const reviewTimeoutMs = options.reviewTimeoutMs ?? 3_600_000;
+  // Only a background review gets a deadline by default: it is what ends a review nobody opens. A
+  // foreground launch keeps upstream's behaviour and runs until told otherwise.
+  const reviewTimeoutMs = options.reviewTimeoutMs ?? (backgroundReview ? 3_600_000 : null);
   const cleanupGraceMs = options.cleanupGraceMs ?? 300_000;
 
   const logHuman = (message: string): void => {
@@ -1470,15 +1472,18 @@ export async function startServer(options: ServerOptions): Promise<{
         }
 
         if (shutdownClaimed) return;
-        reviewStore.finish('browser_idle');
 
-        if (backgroundReview) {
+        if (!backgroundReview && options.keepAlive) {
+          // A foreground --keep-alive exists so the review can go on over later rounds, so an idle
+          // browser must not latch completion: input stays open and the process stays up.
+          logHuman('Review went idle, but the server is staying alive (--keep-alive)');
+          logHuman('Press Ctrl+C to stop the server');
           return;
         }
 
-        if (options.keepAlive) {
-          logHuman('Review went idle, but the server is staying alive (--keep-alive)');
-          logHuman('Press Ctrl+C to stop the server');
+        reviewStore.finish('browser_idle');
+
+        if (backgroundReview) {
           return;
         }
 
@@ -1548,19 +1553,21 @@ export async function startServer(options: ServerOptions): Promise<{
 
   // One deadline, owned here. A background review then follows completion into its cleanup; a
   // foreground one ends the process, unless the user explicitly asked it to stay.
-  reviewTimeoutTimer = setTimeout(() => {
-    reviewStore.finish('review_timeout');
-    if (backgroundReview) return;
-    if (options.keepAlive) {
-      // Keep-alive keeps the server reachable, but the review is over: the page can no longer be
-      // commented on, and saying nothing would leave that looking like a bug.
-      logHuman('Review timed out. The server is staying up (--keep-alive), but input is closed.');
-      logHuman('Press Ctrl+C to stop the server');
-      return;
-    }
-    logHuman('Review timed out, shutting down server...');
-    startShutdown();
-  }, reviewTimeoutMs).unref();
+  if (reviewTimeoutMs !== null) {
+    reviewTimeoutTimer = setTimeout(() => {
+      reviewStore.finish('review_timeout');
+      if (backgroundReview) return;
+      if (options.keepAlive) {
+        // Keep-alive keeps the server reachable, but the review is over: the page can no longer be
+        // commented on, and saying nothing would leave that looking like a bug.
+        logHuman('Review timed out. The server is staying up (--keep-alive), but input is closed.');
+        logHuman('Press Ctrl+C to stop the server');
+        return;
+      }
+      logHuman('Review timed out, shutting down server...');
+      startShutdown();
+    }, reviewTimeoutMs).unref();
+  }
 
   // Guard against lifecycle timers and process handlers outliving this server.
   server.on('close', () => {

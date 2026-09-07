@@ -2644,6 +2644,33 @@ describe('Server Integration Tests', () => {
       }
     });
 
+    it('arms no review deadline for a foreground launch without an explicit timeout', async () => {
+      vi.useFakeTimers();
+      try {
+        const result = await startServer({
+          selection: { baseCommitish: 'HEAD^', targetCommitish: 'HEAD' },
+        });
+        servers.push(result.server);
+
+        expect(result.getReviewSnapshot().session.limits.timeoutMs).toBeNull();
+        await vi.advanceTimersByTimeAsync(2 * 3_600_000);
+        expect(result.getReviewSnapshot().session.state).toBe('active');
+        expect(process.exit).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps the one-hour default deadline for a background review', async () => {
+      const result = await startServer({
+        selection: { baseCommitish: 'HEAD^', targetCommitish: 'HEAD' },
+        backgroundReview: true,
+      });
+      servers.push(result.server);
+
+      expect(result.getReviewSnapshot().session.limits.timeoutMs).toBe(3_600_000);
+    });
+
     it('finishes a background review at its deadline despite inherited keep-alive', async () => {
       vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
       try {
@@ -2829,6 +2856,31 @@ describe('Server Integration Tests', () => {
       servers.push(server);
 
       expect(port).toBeGreaterThanOrEqual(4966);
+    });
+
+    it('keeps a foreground keep-alive review active after the browser goes idle', async () => {
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        keepAlive: true,
+        idleGraceMs: 50,
+        preferredPort: 9073,
+      });
+      servers.push(result.server);
+
+      const controller = new AbortController();
+      const response = await commentClientFetch(`${testHttpUrl(result.server)}/api/heartbeat`, {
+        signal: controller.signal,
+      }).catch(() => null);
+      const reader = response?.body?.getReader();
+      if (reader) await reader.read();
+      controller.abort();
+
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // --keep-alive exists so the review can continue over later rounds, so idling must not
+      // latch completion: comment input stays open and the process stays up.
+      expect(result.getReviewSnapshot().session.state).toBe('active');
+      expect(process.exit).not.toHaveBeenCalled();
     });
 
     it('does not call process.exit on client disconnect when keepAlive is true', async () => {

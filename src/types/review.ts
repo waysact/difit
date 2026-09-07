@@ -16,7 +16,8 @@ export type ReviewEventType =
 
 export interface ReviewLimits {
   idleGraceMs: number;
-  timeoutMs: number;
+  /** Null when no deadline is armed, which is a foreground launch without `--timeout`. */
+  timeoutMs: number | null;
   cleanupGraceMs: number;
 }
 
