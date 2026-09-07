@@ -67,6 +67,14 @@ For uncommitted changes, if files not yet added to git should also appear in the
 <difit-command> . --include-untracked
 ```
 
+## Optional Window Title
+
+If more than one difit session might be open in the browser at the same time, set `--title` to something that identifies this one — the task, branch, or repository — so the user can tell the tabs apart.
+
+```bash
+<difit-command> <target> [compare-with] --title "Fix auth timeout bug"
+```
+
 ## Reusing a Running Server
 
 Keep at most one live difit server per Git root and review target. When you edit again after starting a review, reuse the running server instead of launching another one — repeated launches create duplicate ports and browser tabs.

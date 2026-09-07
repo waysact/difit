@@ -1357,6 +1357,29 @@ describe('Server Integration Tests', () => {
       expect(data).toHaveProperty('requestedTargetCommitish', 'HEAD');
     });
 
+    it('GET /api/diff omits windowTitle when --title is not provided', async () => {
+      const response = await commentClientFetch(`${httpUrl}/api/diff`);
+      const data = (await response.json()) as any;
+
+      expect(response.ok).toBe(true);
+      expect(data.windowTitle).toBeUndefined();
+    });
+
+    it('GET /api/diff returns windowTitle when --title is provided', async () => {
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        preferredPort: 9032,
+        title: 'My Custom Title',
+      });
+      servers.push(result.server);
+
+      const response = await commentClientFetch(`${testHttpUrl(result.server)}/api/diff`);
+      const data = (await response.json()) as any;
+
+      expect(response.ok).toBe(true);
+      expect(data.windowTitle).toBe('My Custom Title');
+    });
+
     it('GET /api/diff returns a JSON 500 on parse failure and does not poison subsequent requests', async () => {
       const parser = parserInstances.at(-1);
       parser?.parseDiff.mockClear();

@@ -162,6 +162,7 @@ Stdin mode is selected with intent-first rules:
 | `--max-port <port>`       | `--port` + 99     | Highest port the fallback search may try before it fails                                                           |
 | `--strict-port`           | false             | Fail immediately instead of trying the next port                                                                   |
 | `--public-url <template>` | -                 | URL to report instead of the bound one; `{port}` is substituted once the port is known                             |
+| `--title <title>`         | -                 | Custom window title for the browser tab                                                                            |
 
 ## 💬 Comment System
 

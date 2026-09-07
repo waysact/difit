@@ -151,6 +151,7 @@ git diff --cached | difit -
 | `--keep-alive`        | false          | 브라우저 연결이 끊겨도 서버 유지 (Ctrl+C로 수동 종료)                                         |
 | `--background`        | false          | 서버를 백그라운드에서 계속 실행하고 JSON 연결 정보 출력                                       |
 | `--context <lines>`   | Git 기본값 (3) | 변경 주변의 컨텍스트 줄 수를 제한 (`0`이면 변경된 줄만 표시, `--pr` 및 stdin에서는 사용 불가) |
+| `--title <title>`     | -              | 브라우저 탭에 표시할 창 제목 사용자 지정                                                      |
 
 ## 💬 코멘트 시스템
 

@@ -93,6 +93,7 @@ export interface ServerOptions {
    * have to wait the real bound out.
    */
   shutdownTimeoutMs?: number;
+  title?: string;
 }
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
@@ -762,6 +763,7 @@ export async function startServer(options: ServerOptions): Promise<{
       repositoryId,
       commentImports: shouldIncludeCommentImports ? initialCommentImports : undefined,
       commentImportId: shouldIncludeCommentImports ? commentImportId : undefined,
+      windowTitle: options.title,
     });
   });
 

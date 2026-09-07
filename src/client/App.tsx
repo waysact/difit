@@ -902,6 +902,12 @@ function App() {
   }, [fetchDiffData]);
 
   useEffect(() => {
+    if (diffData?.windowTitle) {
+      document.title = diffData.windowTitle;
+    }
+  }, [diffData?.windowTitle]);
+
+  useEffect(() => {
     return () => {
       activeDiffAbortControllerRef.current?.abort();
     };

@@ -151,6 +151,7 @@ git diff --cached | difit -
 | `--keep-alive`        | false          | 浏览器断开后保持服务器运行（使用 Ctrl+C 手动停止）                                |
 | `--background`        | false          | 在后台保持服务器运行，并输出 JSON 连接信息                                        |
 | `--context <lines>`   | Git 默认值 (3) | 限制每处变更周围的上下文行数（`0` 仅显示变更行；不可与 `--pr` 或 stdin 一起使用） |
+| `--title <title>`     | -              | 自定义浏览器标签页标题                                                            |
 
 ## 💬 评论系统
 

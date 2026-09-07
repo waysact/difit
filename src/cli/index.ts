@@ -104,6 +104,7 @@ interface CliOptions {
   maxPort?: number;
   strictPort?: boolean;
   publicUrl?: string;
+  title?: string;
 }
 
 const program = new Command();
@@ -156,6 +157,7 @@ program
   .option('--max-port <port>', 'highest port the fallback search may try', parseInt)
   .option('--strict-port', 'fail instead of trying the next port')
   .option('--public-url <template>', 'URL to report; {port} is substituted')
+  .option('--title <title>', 'custom window title for the browser tab')
   .action(async (commitish: string, compareWith: string | undefined, options: CliOptions) => {
     try {
       const isBackgroundChild = process.env[BACKGROUND_CHILD_ENV] === '1';
@@ -325,6 +327,7 @@ program
           strictPort: options.strictPort,
           publicUrl: options.publicUrl,
           ...backgroundLifecycle,
+          title: options.title,
           ...(commentImports.length > 0 ? { commentImports } : {}),
         });
         const reportedUrl = resolvePublicUrl(options.publicUrl, port, url);
@@ -394,6 +397,7 @@ program
         strictPort: options.strictPort,
         publicUrl: options.publicUrl,
         ...backgroundLifecycle,
+        title: options.title,
         ...(commentImports.length > 0 ? { commentImports } : {}),
       });
       const reportedUrl = resolvePublicUrl(options.publicUrl, port, url);
