@@ -62,13 +62,23 @@ describe('useReviewSync', () => {
     vi.resetAllMocks();
   });
 
-  it('keeps a rejected edit pending after refreshing the authoritative snapshot', async () => {
+  it('resends once after a conflict when the queue replays cleanly onto the refreshed snapshot', async () => {
     const agentReply = {
       id: 'a1',
       body: 'Working on it',
       author: 'Agent',
       createdAt: '2026-09-05T10:01:00.000Z',
       updatedAt: '2026-09-05T10:01:00.000Z',
+    };
+    const editedMessage = {
+      ...firstMessage,
+      body: 'Please fix this before merging',
+      updatedAt: '2026-09-05T10:02:00.000Z',
+    };
+    const savedThread = {
+      ...thread,
+      updatedAt: editedMessage.updatedAt,
+      messages: [editedMessage, agentReply],
     };
     const onServerThreads = vi.fn();
     const fetchMock = vi
@@ -84,7 +94,8 @@ describe('useReviewSync', () => {
           version: 2,
           threads: [{ ...thread, messages: [...thread.messages, agentReply] }],
         }),
-      );
+      )
+      .mockResolvedValueOnce(response({ version: 3, threads: [savedThread] }));
 
     const { result } = renderHook(() =>
       useReviewSync({
@@ -107,13 +118,125 @@ describe('useReviewSync', () => {
       });
     });
 
-    await waitFor(() => expect(result.current.status).toBe('conflict'));
+    // The edit carries the message it was made against, and that message is unchanged in the
+    // refreshed snapshot, so the replay is clean and the hook sends it again without being asked.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(result.current.status).toBe('saved'));
 
+    const [, resendRequest] = fetchMock.mock.calls[3] as [string, RequestInit];
+    const resendBody = JSON.parse(String(resendRequest.body)) as {
+      threads: ReviewThread[];
+      baseVersion: number;
+    };
+    expect(resendBody.baseVersion).toBe(2);
+    expect(resendBody.threads[0]?.messages).toEqual([editedMessage, agentReply]);
+    expect(result.current.pending).toEqual([]);
+    expect(onServerThreads).toHaveBeenLastCalledWith([savedThread]);
+  });
+
+  it('parks the queue after a conflict when the refreshed snapshot no longer accepts an edit', async () => {
+    const onServerThreads = vi.fn();
+    const fetchMock = vi
+      .mocked(global.fetch)
+      .mockResolvedValueOnce(
+        response({ sessionId: session.sessionId, review: session, version: 1, threads: [thread] }),
+      )
+      .mockResolvedValueOnce(response({ error: { code: 'version_conflict' } }, 409))
+      // The agent removed the thread the user was replying to.
+      .mockResolvedValueOnce(
+        response({ sessionId: session.sessionId, review: session, version: 2, threads: [] }),
+      );
+
+    const { result } = renderHook(() =>
+      useReviewSync({
+        contextKey: 'repository:base...target',
+        readUrl: '/api/comments-json?base=base&target=target',
+        writeUrl: '/api/comments?base=base&target=target',
+        onServerThreads,
+      }),
+    );
+    await waitFor(() => expect(result.current.status).toBe('saved'));
+
+    act(() => {
+      result.current.enqueue({
+        kind: 'reply',
+        threadId: thread.id,
+        message: {
+          id: 'u2',
+          body: 'One more thing',
+          author: 'User',
+          createdAt: '2026-09-05T10:02:00.000Z',
+          updatedAt: '2026-09-05T10:02:00.000Z',
+        },
+      });
+    });
+
+    await waitFor(() => expect(result.current.status).toBe('conflict'));
     expect(result.current.pending).toHaveLength(1);
-    expect(onServerThreads).toHaveBeenLastCalledWith([
-      { ...thread, messages: [...thread.messages, agentReply] },
-    ]);
+    expect(onServerThreads).toHaveBeenLastCalledWith([]);
     expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+  });
+
+  it('parks the queue when the automatic resend conflicts again', async () => {
+    const agentReply = {
+      id: 'a1',
+      body: 'Working on it',
+      author: 'Agent',
+      createdAt: '2026-09-05T10:01:00.000Z',
+      updatedAt: '2026-09-05T10:01:00.000Z',
+    };
+    const secondAgentReply = { ...agentReply, id: 'a2', body: 'Done' };
+    const fetchMock = vi
+      .mocked(global.fetch)
+      .mockResolvedValueOnce(
+        response({ sessionId: session.sessionId, review: session, version: 1, threads: [thread] }),
+      )
+      .mockResolvedValueOnce(response({ error: { code: 'version_conflict' } }, 409))
+      .mockResolvedValueOnce(
+        response({
+          sessionId: session.sessionId,
+          review: session,
+          version: 2,
+          threads: [{ ...thread, messages: [...thread.messages, agentReply] }],
+        }),
+      )
+      .mockResolvedValueOnce(response({ error: { code: 'version_conflict' } }, 409))
+      .mockResolvedValueOnce(
+        response({
+          sessionId: session.sessionId,
+          review: session,
+          version: 3,
+          threads: [{ ...thread, messages: [...thread.messages, agentReply, secondAgentReply] }],
+        }),
+      );
+
+    const { result } = renderHook(() =>
+      useReviewSync({
+        contextKey: 'repository:base...target',
+        readUrl: '/api/comments-json?base=base&target=target',
+        writeUrl: '/api/comments?base=base&target=target',
+        onServerThreads: vi.fn(),
+      }),
+    );
+    await waitFor(() => expect(result.current.status).toBe('saved'));
+
+    act(() => {
+      result.current.enqueue({
+        kind: 'editMessage',
+        threadId: thread.id,
+        before: firstMessage,
+        body: 'Please fix this before merging',
+        updatedAt: '2026-09-05T10:02:00.000Z',
+      });
+    });
+
+    // One automatic resend, then the queue waits for the user: an agent replying continuously
+    // must not keep this loop running on its own.
+    await waitFor(() => expect(result.current.status).toBe('conflict'));
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(2);
+    expect(result.current.pending).toHaveLength(1);
   });
 
   it('saves an edit queued while the first save is in flight after acknowledging the first batch', async () => {
@@ -250,6 +373,7 @@ describe('useReviewSync', () => {
       createdAt: '2026-09-05T10:01:00.000Z',
       updatedAt: '2026-09-05T10:01:00.000Z',
     };
+    const withAgentReply = { ...thread, messages: [...thread.messages, agentReply] };
     const fetchMock = vi
       .mocked(global.fetch)
       .mockResolvedValueOnce(
@@ -261,10 +385,20 @@ describe('useReviewSync', () => {
           sessionId: session.sessionId,
           review: session,
           version: 2,
-          threads: [{ ...thread, messages: [...thread.messages, agentReply] }],
+          threads: [withAgentReply],
         }),
       )
-      .mockResolvedValueOnce(response({ version: 3, threads: [] }));
+      // The automatic resend conflicts too; only an explicit retry sends after that.
+      .mockResolvedValueOnce(response({ error: { code: 'version_conflict' } }, 409))
+      .mockResolvedValueOnce(
+        response({
+          sessionId: session.sessionId,
+          review: session,
+          version: 3,
+          threads: [withAgentReply],
+        }),
+      )
+      .mockResolvedValueOnce(response({ version: 4, threads: [] }));
 
     return (async () => {
       const { result } = renderHook(() =>
@@ -287,18 +421,18 @@ describe('useReviewSync', () => {
         });
       });
       await waitFor(() => expect(result.current.status).toBe('conflict'));
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock).toHaveBeenCalledTimes(5);
 
       await act(async () => {
         await result.current.retry();
       });
 
-      const [, retryRequest] = fetchMock.mock.calls[3] as [string, RequestInit];
+      const [, retryRequest] = fetchMock.mock.calls[5] as [string, RequestInit];
       const retryBody = JSON.parse(String(retryRequest.body)) as {
         threads: ReviewThread[];
         baseVersion: number;
       };
-      expect(retryBody.baseVersion).toBe(2);
+      expect(retryBody.baseVersion).toBe(3);
       expect(retryBody.threads[0]?.messages).toEqual([
         {
           ...firstMessage,

@@ -190,106 +190,132 @@ export function useReviewSync({
   }, [contextKey, readUrl, setSyncStatus]);
   refreshRef.current = refresh;
 
-  const writePending = useCallback(async (): Promise<void> => {
-    if (inFlightRef.current) return;
-    const activeSession = sessionRef.current;
-    const acknowledged = acknowledgedRef.current;
-    const batch = pendingRef.current;
-    if (!activeSession || !acknowledged || batch.length === 0) return;
-    if (
-      activeSession.state === 'finished' ||
-      draftSessionIdRef.current !== activeSession.sessionId
-    ) {
-      setSyncStatus('closed');
-      return;
-    }
+  // `afterConflict` marks the one automatic resend that follows a conflict refresh, so a second
+  // conflict parks the queue instead of starting another round.
+  const writePending = useCallback(
+    async (afterConflict = false): Promise<void> => {
+      if (inFlightRef.current) return;
+      const activeSession = sessionRef.current;
+      const acknowledged = acknowledgedRef.current;
+      const batch = pendingRef.current;
+      if (!activeSession || !acknowledged || batch.length === 0) return;
+      if (
+        activeSession.state === 'finished' ||
+        draftSessionIdRef.current !== activeSession.sessionId
+      ) {
+        setSyncStatus('closed');
+        return;
+      }
 
-    const projection = applyReviewEdits(acknowledged.threads, batch);
-    if (!projection.ok) {
-      setSyncStatus('conflict');
-      return;
-    }
+      const projection = applyReviewEdits(acknowledged.threads, batch);
+      if (!projection.ok) {
+        setSyncStatus('conflict');
+        return;
+      }
 
-    const generation = requestGenerationRef.current;
-    inFlightRef.current = true;
-    setSyncStatus('saving');
-    let hasRemainingWork = false;
-    try {
-      const response = await fetch(writeUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Difit-Session': activeSession.sessionId,
-        },
-        body: JSON.stringify({ threads: projection.threads, baseVersion: acknowledged.version }),
-      });
+      const generation = requestGenerationRef.current;
+      inFlightRef.current = true;
+      setSyncStatus('saving');
+      let hasRemainingWork = false;
+      let resendAfterConflict = false;
+      try {
+        const response = await fetch(writeUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Difit-Session': activeSession.sessionId,
+          },
+          body: JSON.stringify({ threads: projection.threads, baseVersion: acknowledged.version }),
+        });
 
-      if (generation !== requestGenerationRef.current) return;
+        if (generation !== requestGenerationRef.current) return;
 
-      if (response.status === 409) {
-        try {
-          await refresh();
-        } finally {
-          if (generation === requestGenerationRef.current) {
-            const current = sessionRef.current;
-            const writable =
-              current !== null &&
-              current.state === 'active' &&
-              draftSessionIdRef.current === current.sessionId;
-            setSyncStatus(writable ? 'conflict' : 'closed');
+        if (response.status === 409) {
+          // Another writer moved the collection. Refresh, then replay the queue onto what came back:
+          // every edit records the value it was made against, so a clean replay never resends a
+          // stale collection and is safe to send once unasked. Anything else waits for the user, and
+          // so does a second conflict, or a continuously replying agent could keep this loop going.
+          let refreshed = false;
+          try {
+            await refresh();
+            refreshed = true;
+          } finally {
+            if (generation === requestGenerationRef.current) {
+              const current = sessionRef.current;
+              const writable =
+                current !== null &&
+                current.state === 'active' &&
+                draftSessionIdRef.current === current.sessionId;
+              const snapshot = acknowledgedRef.current;
+              resendAfterConflict =
+                refreshed &&
+                writable &&
+                !afterConflict &&
+                snapshot !== null &&
+                pendingRef.current.length > 0 &&
+                applyReviewEdits(snapshot.threads, pendingRef.current).ok;
+              if (!resendAfterConflict) setSyncStatus(writable ? 'conflict' : 'closed');
+            }
+          }
+          return;
+        }
+
+        if (!response.ok) {
+          console.error(
+            `Failed to save review comments: ${response.status} ${response.statusText}`,
+          );
+          setSyncStatus('unsaved');
+          return;
+        }
+
+        const payload = (await response.json()) as ReviewCommentsPayload;
+        const nextThreads = normalizeReviewThreads(payload.threads);
+        const nextVersion = payload.version;
+        if (typeof nextVersion !== 'number') {
+          throw new Error('Review save response did not include a version');
+        }
+        // A refresh may already have adopted a newer version while this write was outstanding, so
+        // the write's own payload must not drag the acknowledged snapshot backwards either.
+        const adopted = acknowledgedRef.current;
+        if (
+          !adopted ||
+          adopted.session.sessionId !== activeSession.sessionId ||
+          nextVersion >= adopted.version
+        ) {
+          acknowledgedRef.current = {
+            session: activeSession,
+            threads: nextThreads,
+            version: nextVersion,
+          };
+          setVersion(nextVersion);
+          onServerThreadsRef.current(nextThreads);
+        }
+
+        const queuedNow = pendingRef.current;
+        const batchIsPrefix = batch.every((edit, index) => queuedNow[index] === edit);
+        const remaining = batchIsPrefix ? queuedNow.slice(batch.length) : queuedNow;
+        replacePending(remaining);
+        // Work queued while this write was in flight is not saved yet; the drain below sends it.
+        hasRemainingWork = remaining.length > 0;
+        setSyncStatus(hasRemainingWork ? 'unsaved' : 'saved');
+      } catch (error) {
+        if (generation === requestGenerationRef.current) {
+          console.error('Failed to save review comments:', error);
+          setSyncStatus(sessionRef.current?.state === 'finished' ? 'closed' : 'unsaved');
+        }
+      } finally {
+        inFlightRef.current = false;
+        if (generation === requestGenerationRef.current) {
+          if (resendAfterConflict) {
+            void writePending(true);
+          } else if (hasRemainingWork) {
+            void writePending();
           }
         }
-        return;
       }
-
-      if (!response.ok) {
-        console.error(`Failed to save review comments: ${response.status} ${response.statusText}`);
-        setSyncStatus('unsaved');
-        return;
-      }
-
-      const payload = (await response.json()) as ReviewCommentsPayload;
-      const nextThreads = normalizeReviewThreads(payload.threads);
-      const nextVersion = payload.version;
-      if (typeof nextVersion !== 'number') {
-        throw new Error('Review save response did not include a version');
-      }
-      // A refresh may already have adopted a newer version while this write was outstanding, so
-      // the write's own payload must not drag the acknowledged snapshot backwards either.
-      const adopted = acknowledgedRef.current;
-      if (
-        !adopted ||
-        adopted.session.sessionId !== activeSession.sessionId ||
-        nextVersion >= adopted.version
-      ) {
-        acknowledgedRef.current = {
-          session: activeSession,
-          threads: nextThreads,
-          version: nextVersion,
-        };
-        setVersion(nextVersion);
-        onServerThreadsRef.current(nextThreads);
-      }
-
-      const queuedNow = pendingRef.current;
-      const batchIsPrefix = batch.every((edit, index) => queuedNow[index] === edit);
-      const remaining = batchIsPrefix ? queuedNow.slice(batch.length) : queuedNow;
-      replacePending(remaining);
-      // Work queued while this write was in flight is not saved yet; the drain below sends it.
-      hasRemainingWork = remaining.length > 0;
-      setSyncStatus(hasRemainingWork ? 'unsaved' : 'saved');
-    } catch (error) {
-      if (generation === requestGenerationRef.current) {
-        console.error('Failed to save review comments:', error);
-        setSyncStatus(sessionRef.current?.state === 'finished' ? 'closed' : 'unsaved');
-      }
-    } finally {
-      inFlightRef.current = false;
-      if (hasRemainingWork && generation === requestGenerationRef.current) {
-        void writePending();
-      }
-    }
-  }, [refresh, replacePending, setSyncStatus, writeUrl]);
+    },
+    [refresh, replacePending, setSyncStatus, writeUrl],
+  );
 
   const enqueue = useCallback(
     (edit: PendingReviewEdit) => {
