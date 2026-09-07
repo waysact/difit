@@ -22,11 +22,13 @@ import {
   CUSTOM_EDITOR_ID,
   NONE_EDITOR_ID,
   resolveEditorOption,
+  resolveEnvEditor,
 } from '../utils/editorOptions.js';
 import { getFileExtension } from '../utils/fileUtils.js';
 
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
+import { isLoopbackAddress } from './loopback.js';
 import { ReviewLifecycle } from './review-lifecycle.js';
 import { parseUserSettingsPatch, readUserConfig, updateUserClientSettings } from './user-config.js';
 
@@ -128,6 +130,15 @@ export async function startServer(
   options: ServerOptions,
 ): Promise<{ port: number; url: string; isEmpty?: boolean; server?: Server }> {
   const app = express();
+  // Set once `listen` succeeds, below, from the OS-resolved bind address
+  // (`server.address()`) rather than the raw `--host` string: `net.isIP`
+  // rejects abbreviated IPv4 forms (`127.1`) that `listen` still resolves to
+  // loopback, so classifying the resolved address is what keeps this guard —
+  // and the startup warning that shares it — from over-blocking. No request
+  // can reach the route below before `listen`'s callback fires, so the guard
+  // never reads this before it holds the real verdict. Defaults to `false`,
+  // the safe direction, in case that ever changes.
+  let serverBoundToLoopback = false;
   const repositoryPath = resolve(options.repoPath ?? process.cwd());
   const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
@@ -868,6 +879,26 @@ export async function startServer(
       return;
     }
 
+    // The spawn spec comes from the request body, so anything that can reach this
+    // port runs code as our uid. Refuse outright when we are reachable off-host.
+    if (!serverBoundToLoopback) {
+      res.status(403).json({
+        error: 'Open in editor is disabled when the server is not bound to loopback',
+      });
+      return;
+    }
+
+    // Checked before the request is parsed: the old check consulted the caller's
+    // own `editor.id` first, so a body naming any other editor bypassed it.
+    // `resolveEnvEditor` is the single place that encodes DIFIT_EDITOR taking
+    // priority over EDITOR — reused below when resolving the editor id — so
+    // this guard cannot drift out of step with that resolution.
+    const envEditor = resolveEnvEditor();
+    if (envEditor.source && envEditor.id?.toLowerCase() === NONE_EDITOR_ID) {
+      res.status(403).json({ error: `Open in editor is disabled by ${envEditor.source}=none` });
+      return;
+    }
+
     const { filePath, line, editor } = (req.body ?? {}) as {
       filePath?: unknown;
       line?: unknown;
@@ -887,11 +918,10 @@ export async function startServer(
     const resolvedPath = resolve(repositoryPath, filepathResult.path);
 
     const editorRequest = parseEditorRequest(editor);
-    const editorId =
-      editorRequest.id ?? process.env.DIFIT_EDITOR ?? process.env.EDITOR ?? undefined;
+    const editorId = editorRequest.id ?? envEditor.id;
 
     if (editorId?.toLowerCase() === NONE_EDITOR_ID) {
-      res.status(400).json({ error: 'Open in editor is disabled' });
+      res.status(403).json({ error: 'Open in editor is disabled' });
       return;
     }
 
@@ -1076,6 +1106,7 @@ export async function startServer(
     options.preferredPort || 4966,
     options.host || 'localhost',
   );
+  serverBoundToLoopback = isLoopbackAddress(server.address());
 
   // Guard against the idle-shutdown timer outliving this server: clear it on
   // close so a stray fire can never reach a torn-down server.
@@ -1087,9 +1118,10 @@ export async function startServer(
   });
 
   // Security warning for non-localhost binding
-  if (options.host && options.host !== '127.0.0.1' && options.host !== 'localhost') {
+  if (!serverBoundToLoopback) {
     console.warn('\n⚠️  WARNING: Server is accessible from external network!');
     console.warn(`   Binding to: ${options.host}:${port}`);
+    console.warn('   Open in editor is disabled while bound off-loopback.');
     console.warn('   Make sure this is intended and your network is secure.\n');
   }
 

@@ -1,13 +1,14 @@
 import { promises as fs } from 'fs';
-import { tmpdir } from 'os';
+import { networkInterfaces, tmpdir } from 'os';
 import { join } from 'path';
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 
 // Set environment variable to skip fetch mocking
 process.env.VITEST_SERVER_TEST = 'true';
 
 import { startServer } from './server.js';
+import { testHttpUrl } from './test-http-url.js';
 import type { CommentImport } from '../types/diff.js';
 
 // Add fetch polyfill for Node.js test environment
@@ -15,23 +16,12 @@ const { fetch } = await import('undici');
 globalThis.fetch = fetch as any;
 const parserInstances = vi.hoisted(() => [] as any[]);
 
-// Helper function to get available port
-async function getAvailablePort(preferredPort: number): Promise<number> {
-  let port = preferredPort;
-  const maxAttempts = 10;
-
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      await fetch(`http://localhost:${port}`);
-      // If we get here, port is in use, try next one
-      port++;
-    } catch {
-      // Port is available
-      return port;
-    }
-  }
-
-  return port;
+// `host: '::1'` fails `listen` with EADDRNOTAVAIL on a host without IPv6, so the
+// tests that bind to it are skipped there instead of being flaky.
+function hasIPv6Loopback(): boolean {
+  return Object.values(networkInterfaces()).some((addresses) =>
+    addresses?.some((address) => address.family === 'IPv6' && address.address === '::1'),
+  );
 }
 
 // Mock GitDiffParser
@@ -101,9 +91,8 @@ vi.mock('./git-diff.js', () => {
 describe('Server Integration Tests', () => {
   describe('Comments API', () => {
     it('should accept properly formatted comments', async () => {
-      const port = await getAvailablePort(4966);
       const result = await startServer({
-        preferredPort: port,
+        preferredPort: 4966,
         openBrowser: false,
       });
 
@@ -125,7 +114,7 @@ describe('Server Integration Tests', () => {
           },
         ];
 
-        const response = await fetch(`http://localhost:${result.port}/api/comments`, {
+        const response = await fetch(`${testHttpUrl(result.server!)}/api/comments`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ comments }),
@@ -141,7 +130,7 @@ describe('Server Integration Tests', () => {
         expect(typeof apiResult.version).toBe('number');
 
         // Verify the formatted output
-        const outputResponse = await fetch(`http://localhost:${result.port}/api/comments-output`);
+        const outputResponse = await fetch(`${testHttpUrl(result.server!)}/api/comments-output`);
         const output = await outputResponse.text();
 
         expect(output).toContain('src/App.tsx:L10');
@@ -159,9 +148,8 @@ describe('Server Integration Tests', () => {
     });
 
     it('should handle comments with missing file property gracefully', async () => {
-      const port = await getAvailablePort(4966);
       const result = await startServer({
-        preferredPort: port,
+        preferredPort: 4966,
         openBrowser: false,
       });
 
@@ -176,7 +164,7 @@ describe('Server Integration Tests', () => {
           },
         ];
 
-        const response = await fetch(`http://localhost:${result.port}/api/comments`, {
+        const response = await fetch(`${testHttpUrl(result.server!)}/api/comments`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ comments: commentsWithMissingFile }),
@@ -185,7 +173,7 @@ describe('Server Integration Tests', () => {
         expect(response.status).toBe(200);
 
         // Check the output handles undefined file gracefully
-        const outputResponse = await fetch(`http://localhost:${result.port}/api/comments-output`);
+        const outputResponse = await fetch(`${testHttpUrl(result.server!)}/api/comments-output`);
         const output = await outputResponse.text();
 
         expect(output).toContain('<unknown file>:L10');
@@ -209,15 +197,15 @@ describe('Server Integration Tests', () => {
       messages: [{ id, body, createdAt: isoNow, updatedAt: isoNow }],
     });
 
-    const postThreads = (port: number, threads: unknown[], baseVersion?: number) =>
-      fetch(`http://localhost:${port}/api/comments`, {
+    const postThreads = (httpUrl: string, threads: unknown[], baseVersion?: number) =>
+      fetch(`${httpUrl}/api/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ threads, baseVersion }),
       });
 
-    const getSession = async (port: number) => {
-      const res = await fetch(`http://localhost:${port}/api/comments-json`);
+    const getSession = async (httpUrl: string) => {
+      const res = await fetch(`${httpUrl}/api/comments-json`);
       return (await res.json()) as {
         version: number;
         threads: Array<{ id: string; filePath: string }>;
@@ -225,16 +213,17 @@ describe('Server Integration Tests', () => {
     };
 
     it('merges concurrent agent additions instead of clobbering on a stale push', async () => {
-      const port = await getAvailablePort(4966);
       const result = await startServer({
-        preferredPort: port,
+        preferredPort: 4966,
         openBrowser: false,
       });
 
       try {
         // Browser establishes a thread; it now knows version 1.
-        await postThreads(result.port, [makeThread('t1', 'src/a.ts', 10, 'human thread')]);
-        const afterFirst = await getSession(result.port);
+        await postThreads(testHttpUrl(result.server!), [
+          makeThread('t1', 'src/a.ts', 10, 'human thread'),
+        ]);
+        const afterFirst = await getSession(testHttpUrl(result.server!));
         expect(afterFirst.version).toBe(1);
 
         // An agent adds a second thread out of band (e.g. `difit comment add`).
@@ -248,7 +237,7 @@ describe('Server Integration Tests', () => {
             author: 'Agent',
           },
         ];
-        await fetch(`http://localhost:${result.port}/api/comment-imports`, {
+        await fetch(`${testHttpUrl(result.server!)}/api/comment-imports`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(agentImport),
@@ -257,7 +246,7 @@ describe('Server Integration Tests', () => {
         // The browser, unaware of the agent's thread, pushes its stale set
         // tagged with the version it last observed (1).
         const staleResponse = await postThreads(
-          result.port,
+          testHttpUrl(result.server!),
           [makeThread('t1', 'src/a.ts', 10, 'human thread')],
           1,
         );
@@ -265,7 +254,7 @@ describe('Server Integration Tests', () => {
         expect(staleResult.merged).toBe(true);
 
         // The agent's thread must survive the stale push.
-        const final = await getSession(result.port);
+        const final = await getSession(testHttpUrl(result.server!));
         expect(final.threads).toHaveLength(2);
         expect(final.threads.some((thread) => thread.id === 't1')).toBe(true);
         expect(final.threads.some((thread) => thread.id === 'agent-1')).toBe(true);
@@ -279,25 +268,26 @@ describe('Server Integration Tests', () => {
     });
 
     it('replaces (honoring deletions) when the push version matches', async () => {
-      const port = await getAvailablePort(4966);
       const result = await startServer({
-        preferredPort: port,
+        preferredPort: 4966,
         openBrowser: false,
       });
 
       try {
-        await postThreads(result.port, [makeThread('t1', 'src/a.ts', 10, 'human thread')]);
-        const afterFirst = await getSession(result.port);
+        await postThreads(testHttpUrl(result.server!), [
+          makeThread('t1', 'src/a.ts', 10, 'human thread'),
+        ]);
+        const afterFirst = await getSession(testHttpUrl(result.server!));
         expect(afterFirst.version).toBe(1);
         expect(afterFirst.threads).toHaveLength(1);
 
         // Same version means no concurrent writer, so an empty set is a real
         // deletion and must be honored (not merged back).
-        const response = await postThreads(result.port, [], afterFirst.version);
+        const response = await postThreads(testHttpUrl(result.server!), [], afterFirst.version);
         const body = (await response.json()) as { merged: boolean };
         expect(body.merged).toBe(false);
 
-        const final = await getSession(result.port);
+        const final = await getSession(testHttpUrl(result.server!));
         expect(final.threads).toHaveLength(0);
       } finally {
         if (result.server) {
@@ -309,19 +299,20 @@ describe('Server Integration Tests', () => {
     });
 
     it('bumps the version when a reply is imported (so the change is broadcast)', async () => {
-      const port = await getAvailablePort(4966);
       const result = await startServer({
-        preferredPort: port,
+        preferredPort: 4966,
         openBrowser: false,
       });
 
       try {
-        await postThreads(result.port, [makeThread('t1', 'src/a.ts', 10, 'human thread')]);
-        const before = await getSession(result.port);
+        await postThreads(testHttpUrl(result.server!), [
+          makeThread('t1', 'src/a.ts', 10, 'human thread'),
+        ]);
+        const before = await getSession(testHttpUrl(result.server!));
 
         // A reply via comment-imports must register as a change — otherwise the
         // server skips the commentsChanged broadcast and open browsers go stale.
-        await fetch(`http://localhost:${result.port}/api/comment-imports`, {
+        await fetch(`${testHttpUrl(result.server!)}/api/comment-imports`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify([
@@ -335,7 +326,7 @@ describe('Server Integration Tests', () => {
           ] satisfies CommentImport[]),
         });
 
-        const after = await getSession(result.port);
+        const after = await getSession(testHttpUrl(result.server!));
         expect(after.version).toBeGreaterThan(before.version);
       } finally {
         if (result.server) {
@@ -373,6 +364,16 @@ describe('Server Integration Tests', () => {
   });
 
   describe('Server startup', () => {
+    let warnSpy: MockInstance<typeof console.warn>;
+
+    beforeEach(() => {
+      warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warnSpy.mockRestore();
+    });
+
     it('starts on preferred port', async () => {
       // Use a high port number to avoid conflicts
       const preferredPort = 9000;
@@ -421,6 +422,58 @@ describe('Server Integration Tests', () => {
       expect(result.url).toContain('http://localhost:'); // Display host conversion
     });
 
+    it('warns that open-in-editor is disabled when bound off-loopback', async () => {
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '0.0.0.0',
+        preferredPort: 9021,
+      });
+      servers.push(result.server);
+
+      const warnedLines = warnSpy.mock.calls.map((call) => call[0]);
+      expect(
+        warnedLines.some(
+          (line) => typeof line === 'string' && line.includes('accessible from external network'),
+        ),
+      ).toBe(true);
+      expect(
+        warnedLines.some(
+          (line) =>
+            typeof line === 'string' &&
+            line.includes('Open in editor is disabled while bound off-loopback.'),
+        ),
+      ).toBe(true);
+    });
+
+    it('does not warn when bound to 127.1, an abbreviated form that resolves to loopback', async () => {
+      // net.isIP rejects "127.1", but Node's listen() falls through to
+      // getaddrinfo, which expands it to 127.0.0.1 and binds loopback-only.
+      // The warning must read the OS-resolved bind address, not the raw
+      // --host string, or it wrongly claims external accessibility here.
+      const result = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.1',
+        preferredPort: 9023,
+      });
+      servers.push(result.server);
+
+      expect(warnSpy).not.toHaveBeenCalled();
+    });
+
+    it.runIf(hasIPv6Loopback())(
+      'does not warn when bound to ::1, a loopback address the old ad-hoc check missed',
+      async () => {
+        const result = await startServer({
+          selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+          host: '::1',
+          preferredPort: 9022,
+        });
+        servers.push(result.server);
+
+        expect(warnSpy).not.toHaveBeenCalled();
+      },
+    );
+
     it('passes context lines to the initial diff load', async () => {
       const result = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
@@ -439,7 +492,7 @@ describe('Server Integration Tests', () => {
   });
 
   describe('API endpoints', () => {
-    let port: number;
+    let httpUrl: string;
 
     beforeEach(async () => {
       const result = await startServer({
@@ -447,11 +500,11 @@ describe('Server Integration Tests', () => {
         preferredPort: 9030,
       });
       servers.push(result.server);
-      port = result.port;
+      httpUrl = testHttpUrl(result.server!);
     });
 
     it('GET /api/diff returns diff data', async () => {
-      const response = await fetch(`http://localhost:${port}/api/diff`);
+      const response = await fetch(`${httpUrl}/api/diff`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -473,15 +526,13 @@ describe('Server Integration Tests', () => {
         new Error('Failed to parse diff for nonexistent vs HEAD: unknown revision'),
       );
 
-      const errorResponse = await fetch(`http://localhost:${port}/api/diff?target=nonexistent`);
+      const errorResponse = await fetch(`${httpUrl}/api/diff?target=nonexistent`);
       expect(errorResponse.status).toBe(500);
       expect(errorResponse.headers.get('content-type')).toContain('application/json');
       const errorBody = (await errorResponse.json()) as any;
       expect(typeof errorBody.error).toBe('string');
 
-      const recoveredResponse = await fetch(
-        `http://localhost:${port}/api/diff?ignoreWhitespace=true`,
-      );
+      const recoveredResponse = await fetch(`${httpUrl}/api/diff?ignoreWhitespace=true`);
       expect(recoveredResponse.status).toBe(200);
 
       expect(parser?.parseDiff).toHaveBeenLastCalledWith(
@@ -492,7 +543,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('GET /api/diff?ignoreWhitespace=true handles whitespace ignore', async () => {
-      const response = await fetch(`http://localhost:${port}/api/diff?ignoreWhitespace=true`);
+      const response = await fetch(`${httpUrl}/api/diff?ignoreWhitespace=true`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -511,7 +562,7 @@ describe('Server Integration Tests', () => {
       parser?.parseDiff.mockClear();
 
       const response = await fetch(
-        `http://localhost:${result.port}/api/diff?base=main&target=feature&ignoreWhitespace=true`,
+        `${testHttpUrl(result.server!)}/api/diff?base=main&target=feature&ignoreWhitespace=true`,
       );
 
       expect(response.ok).toBe(true);
@@ -538,7 +589,7 @@ describe('Server Integration Tests', () => {
       });
 
       const response = await fetch(
-        `http://localhost:${port}/api/diff?base=origin%2Fmain&target=.&baseMode=merge-base`,
+        `${httpUrl}/api/diff?base=origin%2Fmain&target=.&baseMode=merge-base`,
       );
       const data = (await response.json()) as any;
 
@@ -568,17 +619,17 @@ describe('Server Integration Tests', () => {
       parser?.parseDiff.mockClear();
 
       const firstResponse = await fetch(
-        `http://localhost:${result.port}/api/diff?base=main&target=feature`,
+        `${testHttpUrl(result.server!)}/api/diff?base=main&target=feature`,
       );
       expect(firstResponse.ok).toBe(true);
 
       const secondResponse = await fetch(
-        `http://localhost:${result.port}/api/diff?base=HEAD%5E&target=HEAD`,
+        `${testHttpUrl(result.server!)}/api/diff?base=HEAD%5E&target=HEAD`,
       );
       expect(secondResponse.ok).toBe(true);
 
       const thirdResponse = await fetch(
-        `http://localhost:${result.port}/api/diff?base=main&target=feature`,
+        `${testHttpUrl(result.server!)}/api/diff?base=main&target=feature`,
       );
       expect(thirdResponse.ok).toBe(true);
 
@@ -615,13 +666,13 @@ describe('Server Integration Tests', () => {
 
       for (const [base, target] of revisionPairs) {
         const response = await fetch(
-          `http://localhost:${result.port}/api/diff?base=${base}&target=${target}`,
+          `${testHttpUrl(result.server!)}/api/diff?base=${base}&target=${target}`,
         );
         expect(response.ok).toBe(true);
       }
 
       const revisitedResponse = await fetch(
-        `http://localhost:${result.port}/api/diff?base=base-a&target=target-a`,
+        `${testHttpUrl(result.server!)}/api/diff?base=base-a&target=target-a`,
       );
       expect(revisitedResponse.ok).toBe(true);
 
@@ -650,7 +701,7 @@ describe('Server Integration Tests', () => {
       });
       servers.push(importServer.server);
 
-      const response = await fetch(`http://localhost:${importServer.port}/api/diff`);
+      const response = await fetch(`${testHttpUrl(importServer.server!)}/api/diff`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -676,7 +727,7 @@ describe('Server Integration Tests', () => {
       });
       servers.push(importServer.server);
 
-      const response = await fetch(`http://localhost:${importServer.port}/api/diff`);
+      const response = await fetch(`${testHttpUrl(importServer.server!)}/api/diff`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -703,7 +754,7 @@ describe('Server Integration Tests', () => {
       servers.push(importServer.server);
 
       const response = await fetch(
-        `http://localhost:${importServer.port}/api/diff?base=main&target=feature`,
+        `${testHttpUrl(importServer.server!)}/api/diff?base=main&target=feature`,
       );
       const data = (await response.json()) as any;
 
@@ -713,9 +764,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('GET /api/generated-status/* returns generated status', async () => {
-      const response = await fetch(
-        `http://localhost:${port}/api/generated-status/src/query.ts?ref=HEAD`,
-      );
+      const response = await fetch(`${httpUrl}/api/generated-status/src/query.ts?ref=HEAD`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -728,9 +777,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('GET /api/generated-status/* rejects paths outside repository', async () => {
-      const response = await fetch(
-        `http://localhost:${port}/api/generated-status/%2Ftmp%2Foutside.txt?ref=HEAD`,
-      );
+      const response = await fetch(`${httpUrl}/api/generated-status/%2Ftmp%2Foutside.txt?ref=HEAD`);
       const data = (await response.json()) as any;
 
       expect(response.status).toBe(400);
@@ -738,9 +785,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('GET /api/generated-status/* rejects parent traversal paths', async () => {
-      const response = await fetch(
-        `http://localhost:${port}/api/generated-status/..%2Foutside.txt?ref=HEAD`,
-      );
+      const response = await fetch(`${httpUrl}/api/generated-status/..%2Foutside.txt?ref=HEAD`);
       const data = (await response.json()) as any;
 
       expect(response.status).toBe(400);
@@ -750,7 +795,7 @@ describe('Server Integration Tests', () => {
     it('POST /api/comments accepts comment data', async () => {
       const comments = [{ file: 'test.js', line: 10, body: 'This is a test comment' }];
 
-      const response = await fetch(`http://localhost:${port}/api/comments`, {
+      const response = await fetch(`${httpUrl}/api/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ comments }),
@@ -767,7 +812,7 @@ describe('Server Integration Tests', () => {
         { file: 'test.js', line: [20, 30], body: 'Multi-line comment' },
       ];
 
-      const response = await fetch(`http://localhost:${port}/api/comments`, {
+      const response = await fetch(`${httpUrl}/api/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ comments }),
@@ -781,7 +826,7 @@ describe('Server Integration Tests', () => {
     it('POST /api/comments handles text/plain content type', async () => {
       const comments = [{ file: 'test.js', line: 10, body: 'This is a test comment' }];
 
-      const response = await fetch(`http://localhost:${port}/api/comments`, {
+      const response = await fetch(`${httpUrl}/api/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({ comments }),
@@ -799,14 +844,14 @@ describe('Server Integration Tests', () => {
         { file: 'test.js', line: 20, side: 'new', body: 'Second comment' },
       ];
 
-      await fetch(`http://localhost:${port}/api/comments`, {
+      await fetch(`${httpUrl}/api/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ comments }),
       });
 
       // Then get the output
-      const response = await fetch(`http://localhost:${port}/api/comments-output`);
+      const response = await fetch(`${httpUrl}/api/comments-output`);
       const output = await response.text();
 
       expect(response.ok).toBe(true);
@@ -826,14 +871,14 @@ describe('Server Integration Tests', () => {
         { file: 'test.js', line: [15, 25], body: 'Multi-line comment' },
       ];
 
-      await fetch(`http://localhost:${port}/api/comments`, {
+      await fetch(`${httpUrl}/api/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ comments }),
       });
 
       // Then get the output
-      const response = await fetch(`http://localhost:${port}/api/comments-output`);
+      const response = await fetch(`${httpUrl}/api/comments-output`);
       const output = await response.text();
 
       expect(response.ok).toBe(true);
@@ -854,7 +899,7 @@ describe('Server Integration Tests', () => {
         },
       ];
 
-      const response = await fetch(`http://localhost:${port}/api/comment-imports`, {
+      const response = await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(imports),
@@ -875,7 +920,7 @@ describe('Server Integration Tests', () => {
         body: 'Single object import',
       };
 
-      const response = await fetch(`http://localhost:${port}/api/comment-imports`, {
+      const response = await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(singleImport),
@@ -888,7 +933,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('POST /api/comment-imports rejects invalid data', async () => {
-      const response = await fetch(`http://localhost:${port}/api/comment-imports`, {
+      const response = await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ invalid: true }),
@@ -900,7 +945,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('GET /api/comments-json returns empty threads by default', async () => {
-      const response = await fetch(`http://localhost:${port}/api/comments-json`);
+      const response = await fetch(`${httpUrl}/api/comments-json`);
 
       expect(response.ok).toBe(true);
       const data = (await response.json()) as any;
@@ -911,13 +956,13 @@ describe('Server Integration Tests', () => {
     it('GET /api/comments-json returns threads after posting comments', async () => {
       const comments = [{ file: 'test.js', line: 10, body: 'JSON test comment' }];
 
-      await fetch(`http://localhost:${port}/api/comments`, {
+      await fetch(`${httpUrl}/api/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ comments }),
       });
 
-      const response = await fetch(`http://localhost:${port}/api/comments-json`);
+      const response = await fetch(`${httpUrl}/api/comments-json`);
 
       expect(response.ok).toBe(true);
       const data = (await response.json()) as any;
@@ -935,13 +980,13 @@ describe('Server Integration Tests', () => {
         },
       ];
 
-      await fetch(`http://localhost:${port}/api/comment-imports`, {
+      await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(imports),
       });
 
-      const outputResponse = await fetch(`http://localhost:${port}/api/comments-output`);
+      const outputResponse = await fetch(`${httpUrl}/api/comments-output`);
       const output = await outputResponse.text();
 
       expect(output).toContain('src/example.ts:L42');
@@ -950,7 +995,7 @@ describe('Server Integration Tests', () => {
 
     it('POST /api/comment-imports merges reply into existing thread', async () => {
       // First add a thread
-      await fetch(`http://localhost:${port}/api/comment-imports`, {
+      await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify([
@@ -965,7 +1010,7 @@ describe('Server Integration Tests', () => {
       });
 
       // Then add a reply
-      await fetch(`http://localhost:${port}/api/comment-imports`, {
+      await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify([
@@ -979,7 +1024,7 @@ describe('Server Integration Tests', () => {
         ]),
       });
 
-      const jsonResponse = await fetch(`http://localhost:${port}/api/comments-json`);
+      const jsonResponse = await fetch(`${httpUrl}/api/comments-json`);
       const data = (await jsonResponse.json()) as any;
 
       const thread = data.threads.find((t: any) => t.filePath === 'src/reply-test.ts');
@@ -1000,18 +1045,18 @@ describe('Server Integration Tests', () => {
       ];
 
       // Send the same import twice
-      await fetch(`http://localhost:${port}/api/comment-imports`, {
+      await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(imports),
       });
-      await fetch(`http://localhost:${port}/api/comment-imports`, {
+      await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(imports),
       });
 
-      const jsonResponse = await fetch(`http://localhost:${port}/api/comments-json`);
+      const jsonResponse = await fetch(`${httpUrl}/api/comments-json`);
       const data = (await jsonResponse.json()) as any;
 
       const threads = data.threads.filter((t: any) => t.filePath === 'src/dedup.ts');
@@ -1019,7 +1064,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('DELETE /api/comments/:threadId removes the thread and bumps the version', async () => {
-      await fetch(`http://localhost:${port}/api/comment-imports`, {
+      await fetch(`${httpUrl}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify([
@@ -1033,11 +1078,11 @@ describe('Server Integration Tests', () => {
         ]),
       });
 
-      const beforeResponse = await fetch(`http://localhost:${port}/api/comments-json`);
+      const beforeResponse = await fetch(`${httpUrl}/api/comments-json`);
       const before = (await beforeResponse.json()) as any;
       expect(before.threads.some((t: any) => t.id === 'delete-me')).toBe(true);
 
-      const deleteResponse = await fetch(`http://localhost:${port}/api/comments/delete-me`, {
+      const deleteResponse = await fetch(`${httpUrl}/api/comments/delete-me`, {
         method: 'DELETE',
       });
       const deleteData = (await deleteResponse.json()) as any;
@@ -1049,13 +1094,13 @@ describe('Server Integration Tests', () => {
       });
       expect(deleteData.version).toBe(before.version + 1);
 
-      const afterResponse = await fetch(`http://localhost:${port}/api/comments-json`);
+      const afterResponse = await fetch(`${httpUrl}/api/comments-json`);
       const after = (await afterResponse.json()) as any;
       expect(after.threads.some((t: any) => t.id === 'delete-me')).toBe(false);
     });
 
     it('DELETE /api/comments/:threadId returns 404 for unknown thread', async () => {
-      const response = await fetch(`http://localhost:${port}/api/comments/does-not-exist`, {
+      const response = await fetch(`${httpUrl}/api/comments/does-not-exist`, {
         method: 'DELETE',
       });
 
@@ -1084,7 +1129,7 @@ describe('Server Integration Tests', () => {
       });
 
       it('GET /api/user-settings returns defaults when no config exists', async () => {
-        const response = await fetch(`http://localhost:${port}/api/user-settings`);
+        const response = await fetch(`${httpUrl}/api/user-settings`);
 
         expect(response.ok).toBe(true);
         const data = (await response.json()) as any;
@@ -1092,7 +1137,7 @@ describe('Server Integration Tests', () => {
       });
 
       it('PUT /api/user-settings merges and persists client settings', async () => {
-        const first = await fetch(`http://localhost:${port}/api/user-settings`, {
+        const first = await fetch(`${httpUrl}/api/user-settings`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1101,7 +1146,7 @@ describe('Server Integration Tests', () => {
         });
         expect(first.ok).toBe(true);
 
-        const second = await fetch(`http://localhost:${port}/api/user-settings`, {
+        const second = await fetch(`${httpUrl}/api/user-settings`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ client: { sidebarWidth: 400 } }),
@@ -1113,7 +1158,7 @@ describe('Server Integration Tests', () => {
           sidebarWidth: 400,
         });
 
-        const getResponse = await fetch(`http://localhost:${port}/api/user-settings`);
+        const getResponse = await fetch(`${httpUrl}/api/user-settings`);
         const data = (await getResponse.json()) as any;
         expect(data.client).toEqual({
           diffViewMode: 'split',
@@ -1130,7 +1175,7 @@ describe('Server Integration Tests', () => {
       });
 
       it('PUT /api/user-settings rejects invalid payloads', async () => {
-        const response = await fetch(`http://localhost:${port}/api/user-settings`, {
+        const response = await fetch(`${httpUrl}/api/user-settings`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ client: 'dark' }),
@@ -1181,7 +1226,7 @@ describe('Server Integration Tests', () => {
         isEmpty: false,
       }));
 
-      await fetch(`http://localhost:${importServer.port}/api/comment-imports`, {
+      await fetch(`${testHttpUrl(importServer.server!)}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify([
@@ -1194,20 +1239,20 @@ describe('Server Integration Tests', () => {
         ]),
       });
 
-      let response = await fetch(`http://localhost:${importServer.port}/api/comments-output`);
+      let response = await fetch(`${testHttpUrl(importServer.server!)}/api/comments-output`);
       let output = await response.text();
       expect(output).toContain('Startup comment');
       expect(output).toContain('API comment');
 
       await fetch(
-        `http://localhost:${importServer.port}/api/diff?base=feat%2F292-comment-read-write&target=codex%2Fcomment-session-state`,
+        `${testHttpUrl(importServer.server!)}/api/diff?base=feat%2F292-comment-read-write&target=codex%2Fcomment-session-state`,
       );
 
-      response = await fetch(`http://localhost:${importServer.port}/api/comments-output`);
+      response = await fetch(`${testHttpUrl(importServer.server!)}/api/comments-output`);
       output = await response.text();
       expect(output).toBe('');
 
-      await fetch(`http://localhost:${importServer.port}/api/comment-imports`, {
+      await fetch(`${testHttpUrl(importServer.server!)}/api/comment-imports`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify([
@@ -1220,15 +1265,15 @@ describe('Server Integration Tests', () => {
         ]),
       });
 
-      response = await fetch(`http://localhost:${importServer.port}/api/comments-output`);
+      response = await fetch(`${testHttpUrl(importServer.server!)}/api/comments-output`);
       output = await response.text();
       expect(output).toContain('Other diff comment');
       expect(output).not.toContain('Startup comment');
       expect(output).not.toContain('API comment');
 
-      await fetch(`http://localhost:${importServer.port}/api/diff?base=HEAD%5E&target=HEAD`);
+      await fetch(`${testHttpUrl(importServer.server!)}/api/diff?base=HEAD%5E&target=HEAD`);
 
-      response = await fetch(`http://localhost:${importServer.port}/api/comments-output`);
+      response = await fetch(`${testHttpUrl(importServer.server!)}/api/comments-output`);
       output = await response.text();
       expect(output).toContain('Startup comment');
       expect(output).toContain('API comment');
@@ -1248,7 +1293,7 @@ describe('Server Integration Tests', () => {
       });
       servers.push(stdinServer.server);
 
-      const response = await fetch(`http://localhost:${stdinServer.port}/api/diff`);
+      const response = await fetch(`${testHttpUrl(stdinServer.server!)}/api/diff`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -1263,7 +1308,7 @@ describe('Server Integration Tests', () => {
       servers.push(stdinServer.server);
 
       const response = await fetch(
-        `http://localhost:${stdinServer.port}/api/generated-status/stdin-test.js?ref=HEAD`,
+        `${testHttpUrl(stdinServer.server!)}/api/generated-status/stdin-test.js?ref=HEAD`,
       );
       const data = (await response.json()) as any;
 
@@ -1296,7 +1341,7 @@ describe('Server Integration Tests', () => {
       });
       servers.push(result.server);
 
-      const response = await fetch(`http://localhost:${result.port}/`);
+      const response = await fetch(`${testHttpUrl(result.server!)}/`);
       const html = await response.text();
 
       expect(response.ok).toBe(true);
@@ -1315,7 +1360,7 @@ describe('Server Integration Tests', () => {
 
       // In production, it should try to serve static files
       // This might 404 if dist/client doesn't exist, but that's expected
-      const response = await fetch(`http://localhost:${result.port}/`);
+      const response = await fetch(`${testHttpUrl(result.server!)}/`);
 
       // We don't expect a specific response since dist/client may not exist
       // But the server should not crash
@@ -1331,7 +1376,7 @@ describe('Server Integration Tests', () => {
       });
       servers.push(result.server);
 
-      const response = await fetch(`http://localhost:${result.port}/not-a-route`);
+      const response = await fetch(`${testHttpUrl(result.server!)}/not-a-route`);
 
       expect(response.status).toBe(404);
     });
@@ -1344,7 +1389,7 @@ describe('Server Integration Tests', () => {
       });
       servers.push(result.server);
 
-      const response = await fetch(`http://localhost:${result.port}/api/revisions`);
+      const response = await fetch(`${testHttpUrl(result.server!)}/api/revisions`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -1370,7 +1415,7 @@ describe('Server Integration Tests', () => {
       });
       servers.push(result.server);
 
-      const response = await fetch(`http://localhost:${result.port}/api/comments`, {
+      const response = await fetch(`${testHttpUrl(result.server!)}/api/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: 'invalid json',
@@ -1394,7 +1439,7 @@ describe('Server Integration Tests', () => {
       });
       servers.push(result.server);
 
-      const response = await fetch(`http://localhost:${result.port}/api/diff`);
+      const response = await fetch(`${testHttpUrl(result.server!)}/api/diff`);
 
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('http://localhost:*');
       expect(response.headers.get('Access-Control-Allow-Methods')).toBe(
@@ -1407,7 +1452,7 @@ describe('Server Integration Tests', () => {
   });
 
   describe('Line count API', () => {
-    let port: number;
+    let httpUrl: string;
 
     beforeEach(async () => {
       const result = await startServer({
@@ -1415,12 +1460,12 @@ describe('Server Integration Tests', () => {
         preferredPort: 9050,
       });
       servers.push(result.server);
-      port = result.port;
+      httpUrl = testHttpUrl(result.server!);
     });
 
     it('returns line counts for repository files', async () => {
       const response = await fetch(
-        `http://localhost:${port}/api/line-count/src%2Findex.ts?oldRef=HEAD~1&newRef=HEAD`,
+        `${httpUrl}/api/line-count/src%2Findex.ts?oldRef=HEAD~1&newRef=HEAD`,
       );
       const data = (await response.json()) as any;
 
@@ -1432,7 +1477,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('rejects paths outside repository', async () => {
-      const response = await fetch(`http://localhost:${port}/api/line-count/..%2Foutside.txt`);
+      const response = await fetch(`${httpUrl}/api/line-count/..%2Foutside.txt`);
       const data = (await response.json()) as any;
 
       expect(response.status).toBe(400);
@@ -1441,7 +1486,7 @@ describe('Server Integration Tests', () => {
 
     it('rejects oldPath values outside repository', async () => {
       const response = await fetch(
-        `http://localhost:${port}/api/line-count/src%2Findex.ts?oldRef=HEAD~1&oldPath=..%2Foutside.txt`,
+        `${httpUrl}/api/line-count/src%2Findex.ts?oldRef=HEAD~1&oldPath=..%2Foutside.txt`,
       );
       const data = (await response.json()) as any;
 
@@ -1451,7 +1496,7 @@ describe('Server Integration Tests', () => {
   });
 
   describe('Blob API endpoints', () => {
-    let port: number;
+    let httpUrl: string;
 
     beforeEach(async () => {
       const result = await startServer({
@@ -1459,11 +1504,11 @@ describe('Server Integration Tests', () => {
         preferredPort: 9060,
       });
       servers.push(result.server);
-      port = result.port;
+      httpUrl = testHttpUrl(result.server!);
     });
 
     it('GET /api/blob/* returns file content for images', async () => {
-      const response = await fetch(`http://localhost:${port}/api/blob/image.jpg?ref=HEAD`);
+      const response = await fetch(`${httpUrl}/api/blob/image.jpg?ref=HEAD`);
 
       expect(response.ok).toBe(true);
       expect(response.headers.get('Content-Type')).toBe('image/jpeg');
@@ -1493,13 +1538,13 @@ describe('Server Integration Tests', () => {
       ];
 
       for (const { filename, expectedType } of testCases) {
-        const response = await fetch(`http://localhost:${port}/api/blob/${filename}?ref=HEAD`);
+        const response = await fetch(`${httpUrl}/api/blob/${filename}?ref=HEAD`);
         expect(response.headers.get('Content-Type')).toBe(expectedType);
       }
     });
 
     it('sets default content type for unknown extensions', async () => {
-      const response = await fetch(`http://localhost:${port}/api/blob/unknown.xyz?ref=HEAD`);
+      const response = await fetch(`${httpUrl}/api/blob/unknown.xyz?ref=HEAD`);
 
       expect(response.ok).toBe(true);
       expect(response.headers.get('Content-Type')).toBe('application/octet-stream');
@@ -1509,13 +1554,13 @@ describe('Server Integration Tests', () => {
       const testRefs = ['HEAD', 'main', 'feature-branch', 'abc123'];
 
       for (const ref of testRefs) {
-        const response = await fetch(`http://localhost:${port}/api/blob/image.jpg?ref=${ref}`);
+        const response = await fetch(`${httpUrl}/api/blob/image.jpg?ref=${ref}`);
         expect(response.ok).toBe(true);
       }
     });
 
     it('defaults to HEAD when no ref is provided', async () => {
-      const response = await fetch(`http://localhost:${port}/api/blob/image.jpg`);
+      const response = await fetch(`${httpUrl}/api/blob/image.jpg`);
 
       expect(response.ok).toBe(true);
       // Should use HEAD as default ref
@@ -1541,13 +1586,13 @@ describe('Server Integration Tests', () => {
 
       for (const path of specialPaths) {
         const encodedPath = encodeURIComponent(path);
-        const response = await fetch(`http://localhost:${port}/api/blob/${encodedPath}?ref=HEAD`);
+        const response = await fetch(`${httpUrl}/api/blob/${encodedPath}?ref=HEAD`);
         expect(response.ok).toBe(true);
       }
     });
 
     it('rejects paths outside repository', async () => {
-      const response = await fetch(`http://localhost:${port}/api/blob/..%2Foutside.txt?ref=HEAD`);
+      const response = await fetch(`${httpUrl}/api/blob/..%2Foutside.txt?ref=HEAD`);
       const data = (await response.json()) as any;
 
       expect(response.status).toBe(400);
@@ -1576,7 +1621,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('does not call process.exit on client disconnect when keepAlive is true', async () => {
-      const { port, server } = await startServer({
+      const { server } = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         keepAlive: true,
         idleGraceMs: 50,
@@ -1586,7 +1631,7 @@ describe('Server Integration Tests', () => {
 
       // Connect to heartbeat SSE endpoint and then abort
       const controller = new AbortController();
-      const responsePromise = fetch(`http://localhost:${port}/api/heartbeat`, {
+      const responsePromise = fetch(`${testHttpUrl(server!)}/api/heartbeat`, {
         signal: controller.signal,
       });
 
@@ -1611,7 +1656,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('calls process.exit on client disconnect when keepAlive is false', async () => {
-      const { port, server } = await startServer({
+      const { server } = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         keepAlive: false,
         idleGraceMs: 50,
@@ -1621,7 +1666,7 @@ describe('Server Integration Tests', () => {
 
       // Connect to heartbeat SSE endpoint and then abort
       const controller = new AbortController();
-      const responsePromise = fetch(`http://localhost:${port}/api/heartbeat`, {
+      const responsePromise = fetch(`${testHttpUrl(server!)}/api/heartbeat`, {
         signal: controller.signal,
       });
 
@@ -1645,7 +1690,7 @@ describe('Server Integration Tests', () => {
     });
 
     it('does not exit while a second heartbeat client is still connected', async () => {
-      const { port, server } = await startServer({
+      const { server } = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         keepAlive: false,
         idleGraceMs: 50,
@@ -1657,7 +1702,7 @@ describe('Server Integration Tests', () => {
       const second = new AbortController();
 
       const openHeartbeat = async (controller: AbortController): Promise<void> => {
-        const response = await fetch(`http://localhost:${port}/api/heartbeat`, {
+        const response = await fetch(`${testHttpUrl(server!)}/api/heartbeat`, {
           signal: controller.signal,
         }).catch(() => null);
         const reader = response?.body?.getReader();
@@ -1686,13 +1731,13 @@ describe('Server Integration Tests', () => {
 
   describe('Clear Comments functionality', () => {
     it('includes clearComments flag in diff response when provided', async () => {
-      const { port, server } = await startServer({
+      const { server } = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         clearComments: true,
       });
       servers.push(server);
 
-      const response = await fetch(`http://localhost:${port}/api/diff`);
+      const response = await fetch(`${testHttpUrl(server!)}/api/diff`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -1700,12 +1745,12 @@ describe('Server Integration Tests', () => {
     });
 
     it('does not include clearComments flag when not provided', async () => {
-      const { port, server } = await startServer({
+      const { server } = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
       });
       servers.push(server);
 
-      const response = await fetch(`http://localhost:${port}/api/diff`);
+      const response = await fetch(`${testHttpUrl(server!)}/api/diff`);
       const data = (await response.json()) as any;
 
       expect(response.ok).toBe(true);
@@ -1713,21 +1758,288 @@ describe('Server Integration Tests', () => {
     });
 
     it('preserves clearComments flag across diff requests', async () => {
-      const { port, server } = await startServer({
+      const { server } = await startServer({
         selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
         clearComments: true,
       });
       servers.push(server);
 
       // First request
-      const response1 = await fetch(`http://localhost:${port}/api/diff`);
+      const response1 = await fetch(`${testHttpUrl(server!)}/api/diff`);
       const data1 = (await response1.json()) as any;
       expect(data1.clearComments).toBe(true);
 
       // Second request with different ignoreWhitespace
-      const response2 = await fetch(`http://localhost:${port}/api/diff?ignoreWhitespace=true`);
+      const response2 = await fetch(`${testHttpUrl(server!)}/api/diff?ignoreWhitespace=true`);
       const data2 = (await response2.json()) as any;
       expect(data2.clearComments).toBe(true);
+    });
+  });
+
+  describe('open-in-editor guards', () => {
+    // These tests assert rejection before `spawn` is ever reached, so the exact
+    // command is irrelevant to what is being tested. It is deliberately a path
+    // that cannot exist: if a guard regresses and this fixture actually reaches
+    // `spawn`, the process fails to launch instead of executing a real command.
+    const editorBody = {
+      filePath: 'README.md',
+      line: 1,
+      editor: {
+        id: 'vscode',
+        command: '/nonexistent/difit-guard-test-should-never-run',
+        argsTemplate: '-c id',
+      },
+    };
+
+    // Anyone with DIFIT_EDITOR or EDITOR exported in their shell would otherwise
+    // see the env-guard rejection instead of the message a given test expects.
+    // Start every test from a known, unset state; tests that need a value set
+    // stub it themselves afterwards.
+    beforeEach(() => {
+      vi.stubEnv('DIFIT_EDITOR', undefined);
+      vi.stubEnv('EDITOR', undefined);
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('refuses to spawn when the server is bound beyond loopback', async () => {
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '0.0.0.0',
+        preferredPort: 9100,
+      });
+      servers.push(server);
+
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled when the server is not bound to loopback',
+      );
+    });
+
+    it('still allows the request when bound to loopback', async () => {
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9101,
+      });
+      servers.push(server);
+
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: 'README.md', line: 1, editor: { id: 'none' } }),
+      });
+
+      // 'none' is still rejected, but with the disabled-editor error rather than the
+      // loopback error — proving the loopback guard did not fire.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty('error', 'Open in editor is disabled');
+    });
+
+    it.runIf(hasIPv6Loopback())(
+      'still allows the request when bound to IPv6 loopback',
+      async () => {
+        const { server } = await startServer({
+          selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+          host: '::1',
+          preferredPort: 9109,
+        });
+        servers.push(server);
+
+        expect(server!.address()).toMatchObject({ address: '::1', family: 'IPv6' });
+        const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePath: 'README.md', line: 1, editor: { id: 'none' } }),
+        });
+
+        expect(response.status).toBe(403);
+        expect(await response.json()).toHaveProperty('error', 'Open in editor is disabled');
+      },
+    );
+
+    it('still allows the request when --host is an abbreviated form that resolves to loopback', async () => {
+      // net.isIP rejects "127.1", but listen() resolves it to 127.0.0.1 via
+      // getaddrinfo and binds loopback-only. The guard must read the
+      // OS-resolved bind address, not the raw --host string, or it wrongly
+      // refuses this request.
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.1',
+        preferredPort: 9108,
+      });
+      servers.push(server);
+
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: 'README.md', line: 1, editor: { id: 'none' } }),
+      });
+
+      // 'none' is still rejected, but with the disabled-editor error rather than the
+      // loopback error — proving the loopback guard did not fire.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty('error', 'Open in editor is disabled');
+    });
+
+    it('honours DIFIT_EDITOR=none even when the caller supplies another editor id', async () => {
+      vi.stubEnv('DIFIT_EDITOR', 'none');
+
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9102,
+      });
+      servers.push(server);
+
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled by DIFIT_EDITOR=none',
+      );
+    });
+
+    it('honours EDITOR=none even when the caller supplies another editor id', async () => {
+      vi.stubEnv('DIFIT_EDITOR', undefined);
+      vi.stubEnv('EDITOR', 'none');
+
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9103,
+      });
+      servers.push(server);
+
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      // Asserts the distinct EDITOR message, not just any 403, so this pins the
+      // EDITOR guard rather than the loopback or DIFIT_EDITOR guard.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled by EDITOR=none',
+      );
+    });
+
+    it('falls back to EDITOR=none when DIFIT_EDITOR is an empty string', async () => {
+      vi.stubEnv('DIFIT_EDITOR', '');
+      vi.stubEnv('EDITOR', 'none');
+
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9104,
+      });
+      servers.push(server);
+
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      // An empty DIFIT_EDITOR must not be treated as "set", or it would mask
+      // EDITOR=none and let the request fall through to a real spawn.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled by EDITOR=none',
+      );
+    });
+
+    it('falls back to EDITOR=none when DIFIT_EDITOR is whitespace only', async () => {
+      vi.stubEnv('DIFIT_EDITOR', '   ');
+      vi.stubEnv('EDITOR', 'none');
+
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9105,
+      });
+      servers.push(server);
+
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      // Same as the empty-string case: whitespace-only must also count as unset.
+      expect(response.status).toBe(403);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Open in editor is disabled by EDITOR=none',
+      );
+    });
+
+    it('does not let a real DIFIT_EDITOR value be blocked by EDITOR=none', async () => {
+      vi.stubEnv('DIFIT_EDITOR', 'vscode');
+      vi.stubEnv('EDITOR', 'none');
+
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9106,
+      });
+      servers.push(server);
+
+      // A non-blank DIFIT_EDITOR must win over EDITOR, so the env guard must not
+      // fire here. To prove that without ever reaching `spawn`, the body carries
+      // an invalid filePath: the next check the handler runs after the env guard
+      // rejects it with a distinct 400, which could only be reached if the env
+      // guard let the request through.
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: 123 }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toHaveProperty('error', 'Invalid request payload');
+    });
+
+    it('passes a legitimate loopback request all the way through to the spawn attempt', async () => {
+      const { server } = await startServer({
+        selection: { targetCommitish: 'HEAD', baseCommitish: 'HEAD^' },
+        host: '127.0.0.1',
+        preferredPort: 9107,
+      });
+      servers.push(server);
+
+      const response = await fetch(`${testHttpUrl(server!)}/api/open-in-editor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(editorBody),
+      });
+
+      // No guard fires: no DIFIT_EDITOR/EDITOR is set, the host is loopback, and the
+      // request supplies a valid filePath and editor. The 500 below comes only from
+      // the fixture command failing to spawn (it doesn't exist), which proves the
+      // request reached the real spawn attempt without ever executing anything.
+      expect(response.status).toBe(500);
+      expect(await response.json()).toHaveProperty(
+        'error',
+        'Failed to launch editor: command "/nonexistent/difit-guard-test-should-never-run" is not available on PATH',
+      );
     });
   });
 });

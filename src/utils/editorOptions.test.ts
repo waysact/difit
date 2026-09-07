@@ -8,6 +8,7 @@ import {
   NONE_EDITOR_ID,
   parseEditorArgsTemplate,
   resolveEditorOption,
+  resolveEnvEditor,
 } from './editorOptions';
 
 describe('editorOptions', () => {
@@ -256,6 +257,65 @@ describe('editorOptions', () => {
         command: 'emacsclient',
         args: ['--eval', '(tctony/persp-view-file-line-external "/tmp/foo.ts" 42)'],
       });
+    });
+  });
+
+  describe('resolveEnvEditor', () => {
+    it('returns an unset id/source when neither variable is present', () => {
+      expect(resolveEnvEditor({})).toEqual({ id: undefined, source: undefined });
+    });
+
+    it('reads EDITOR when DIFIT_EDITOR is absent', () => {
+      expect(resolveEnvEditor({ EDITOR: 'vim' })).toEqual({ id: 'vim', source: 'EDITOR' });
+    });
+
+    it('prefers DIFIT_EDITOR over EDITOR when both are set', () => {
+      expect(resolveEnvEditor({ DIFIT_EDITOR: 'zed', EDITOR: 'vim' })).toEqual({
+        id: 'zed',
+        source: 'DIFIT_EDITOR',
+      });
+    });
+
+    it('trims a DIFIT_EDITOR value', () => {
+      expect(resolveEnvEditor({ DIFIT_EDITOR: '  zed  ' })).toEqual({
+        id: 'zed',
+        source: 'DIFIT_EDITOR',
+      });
+    });
+
+    it('falls back to EDITOR when DIFIT_EDITOR is an empty string', () => {
+      // An empty DIFIT_EDITOR must not be treated as "set", or it would mask a
+      // real EDITOR value -- EDITOR=none included.
+      expect(resolveEnvEditor({ DIFIT_EDITOR: '', EDITOR: 'none' })).toEqual({
+        id: 'none',
+        source: 'EDITOR',
+      });
+    });
+
+    it('falls back to EDITOR when DIFIT_EDITOR is whitespace only', () => {
+      expect(resolveEnvEditor({ DIFIT_EDITOR: '   ', EDITOR: 'none' })).toEqual({
+        id: 'none',
+        source: 'EDITOR',
+      });
+    });
+
+    it('treats a whitespace-only EDITOR as unset too', () => {
+      expect(resolveEnvEditor({ EDITOR: '   ' })).toEqual({ id: undefined, source: undefined });
+    });
+
+    it('defaults to process.env when no environment is passed', () => {
+      const originalDifitEditor = process.env.DIFIT_EDITOR;
+      const originalEditor = process.env.EDITOR;
+      try {
+        process.env.DIFIT_EDITOR = 'sublime';
+        process.env.EDITOR = 'vim';
+        expect(resolveEnvEditor()).toEqual({ id: 'sublime', source: 'DIFIT_EDITOR' });
+      } finally {
+        if (originalDifitEditor === undefined) delete process.env.DIFIT_EDITOR;
+        else process.env.DIFIT_EDITOR = originalDifitEditor;
+        if (originalEditor === undefined) delete process.env.EDITOR;
+        else process.env.EDITOR = originalEditor;
+      }
     });
   });
 });
