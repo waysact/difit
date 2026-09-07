@@ -6,7 +6,9 @@ import { simpleGit, type SimpleGit } from 'simple-git';
 import pkg from '../../package.json' with { type: 'json' };
 import { startServer } from '../server/server.js';
 import { type CommentImport, type DiffSelection } from '../types/diff.js';
+import type { ReviewSnapshot } from '../types/review.js';
 import { createDiffSelection } from '../utils/diffSelection.js';
+import { resolvePublicUrl } from '../utils/public-url.js';
 import { DiffMode } from '../types/watch.js';
 
 import {
@@ -17,6 +19,11 @@ import {
   parseCommentOptions,
   validateDiffArguments,
   validateIdleGraceSeconds,
+  validateMaxPort,
+  validatePort,
+  validateTimeoutSeconds,
+  validateCleanupGraceSeconds,
+  reviewLifecycleOptions,
   getGitRoot,
   readStdin,
 } from './utils.js';
@@ -92,6 +99,11 @@ interface CliOptions {
   context?: number;
   mergeBase?: boolean;
   idleGrace?: number;
+  cleanupGrace?: number;
+  timeout?: number;
+  maxPort?: number;
+  strictPort?: boolean;
+  publicUrl?: string;
 }
 
 const program = new Command();
@@ -135,6 +147,15 @@ program
     '--merge-base',
     'resolve the base revision with git merge-base before diffing (Git revision mode only)',
   )
+  .option(
+    '--cleanup-grace <seconds>',
+    'seconds a finished background review stays reachable for final processing',
+    parseInt,
+  )
+  .option('--timeout <seconds>', 'give up waiting for a review after N seconds', parseInt)
+  .option('--max-port <port>', 'highest port the fallback search may try', parseInt)
+  .option('--strict-port', 'fail instead of trying the next port')
+  .option('--public-url <template>', 'URL to report; {port} is substituted')
   .action(async (commitish: string, compareWith: string | undefined, options: CliOptions) => {
     try {
       const isBackgroundChild = process.env[BACKGROUND_CHILD_ENV] === '1';
@@ -158,7 +179,64 @@ program
         process.exit(1);
       }
 
+      const portValidation = validatePort(options.port);
+      if (!portValidation.valid) {
+        console.error(`Error: ${portValidation.error}`);
+        process.exit(1);
+      }
+
+      const maxPortValidation = validateMaxPort(options.maxPort, options.port);
+      if (!maxPortValidation.valid) {
+        console.error(`Error: ${maxPortValidation.error}`);
+        process.exit(1);
+      }
+
+      const timeoutValidation = validateTimeoutSeconds(options.timeout);
+      if (!timeoutValidation.valid) {
+        console.error(`Error: ${timeoutValidation.error}`);
+        process.exit(1);
+      }
+
+      const cleanupGraceValidation = validateCleanupGraceSeconds(options.cleanupGrace);
+      if (!cleanupGraceValidation.valid) {
+        console.error(`Error: ${cleanupGraceValidation.error}`);
+        process.exit(1);
+      }
+
+      // One lifecycle description, shared by both input paths. `backgroundReview` is what gives
+      // the server its finite deadline and post-completion cleanup regardless of any inherited
+      // keep-alive flag.
+      const backgroundLifecycle = reviewLifecycleOptions({
+        background: backgroundMode,
+        idleGrace: options.idleGrace,
+        timeout: options.timeout,
+        cleanupGrace: options.cleanupGrace,
+      });
+
+      // Whether this invocation will end up reading a diff from stdin or
+      // `--pr` rather than resolving one from git -- computed up front,
+      // before any of the network or stdin reads below, so a rejection
+      // below fails fast instead of after those side effects.
+      const usesStdinInput =
+        Boolean(options.pr) ||
+        shouldReadStdin({
+          commitish,
+          hasPositionalArgs: program.args.length > 0,
+          hasPrOption: false,
+        });
+
       if (options.background && !isBackgroundChild) {
+        // The detached child gets /dev/null on fd 0, so a piped diff can never reach it. Left
+        // alone it silently reviews the default Git range instead, which looks like a working
+        // review of the wrong thing. `--pr` is fine: the child fetches that patch itself.
+        if (!options.pr && usesStdinInput) {
+          console.error(
+            'Error: --background cannot read a diff from stdin, because the detached server has no stdin. ' +
+              'Run difit in the foreground and background it with your own job control.',
+          );
+          process.exit(1);
+        }
+
         await startBackgroundProcess();
         return;
       }
@@ -173,8 +251,9 @@ program
         process.exit(1);
       }
 
+      // A background review is bounded by the server's own deadline and cleanup, so the launcher
+      // no longer forces keep-alive on; an explicitly supplied one still cannot make it immortal.
       if (backgroundMode) {
-        options.keepAlive = true;
         options.open = false;
       }
 
@@ -213,14 +292,9 @@ program
           );
         }
       } else {
-        // Check if we should read from stdin
-        const readFromStdin = shouldReadStdin({
-          commitish,
-          hasPositionalArgs: program.args.length > 0,
-          hasPrOption: false,
-        });
-
-        if (readFromStdin) {
+        // usesStdinInput was computed above with hasPrOption: false, which
+        // holds in this branch (the `if (options.pr)` above didn't match).
+        if (usesStdinInput) {
           if (options.context !== undefined) {
             console.error('Error: --context option cannot be used with stdin diff');
             process.exit(1);
@@ -239,26 +313,31 @@ program
       }
 
       if (stdinDiff) {
-        // Start server with stdin diff (including --pr patch)
-        const { url, port } = await startServer({
+        // Start server with stdin diff (including --pr patch).
+        const { url, port, getReviewSnapshot } = await startServer({
           stdinDiff,
           preferredPort: options.port,
           host: options.host,
           openBrowser: options.open,
           clearComments: options.clean,
           keepAlive: options.keepAlive,
+          maxPort: options.maxPort,
+          strictPort: options.strictPort,
+          publicUrl: options.publicUrl,
+          ...backgroundLifecycle,
           ...(commentImports.length > 0 ? { commentImports } : {}),
         });
+        const reportedUrl = resolvePublicUrl(options.publicUrl, port, url);
 
         if (backgroundMode) {
-          emitBackgroundHandshake({ port, url, pid: process.pid });
+          announceBackgroundReview(getReviewSnapshot());
           if (isBackgroundChild) {
             ignoreStdioErrorsForBackgroundDaemon();
           }
           return;
         }
 
-        console.log(`\n🚀 difit server started on ${url}`);
+        console.log(`\n🚀 difit server started on ${reportedUrl}`);
         console.log(`📋 Reviewing: ${stdinReviewLabel}`);
         if (options.keepAlive) {
           console.log('🔒 Keep-alive mode: server will stay running after browser disconnects');
@@ -288,7 +367,8 @@ program
       if (selection.targetCommitish === 'working' || selection.targetCommitish === '.') {
         const git = simpleGit(repoPath);
         if (isBackgroundChild && !options.includeUntracked) {
-          // Skip interactive prompts in detached background mode.
+          // Skip interactive prompts in detached background mode, where nobody is watching for
+          // the question.
         } else {
           await handleUntrackedFiles(git, options.includeUntracked);
         }
@@ -300,7 +380,7 @@ program
         process.exit(1);
       }
 
-      const { url, port, isEmpty } = await startServer({
+      const { url, port, isEmpty, getReviewSnapshot } = await startServer({
         selection,
         preferredPort: options.port,
         host: options.host,
@@ -310,19 +390,23 @@ program
         contextLines: options.context,
         diffMode: determineDiffMode(selection, compareWith),
         repoPath,
+        maxPort: options.maxPort,
+        strictPort: options.strictPort,
+        publicUrl: options.publicUrl,
+        ...backgroundLifecycle,
         ...(commentImports.length > 0 ? { commentImports } : {}),
-        ...(options.idleGrace === undefined ? {} : { idleGraceMs: options.idleGrace * 1000 }),
       });
+      const reportedUrl = resolvePublicUrl(options.publicUrl, port, url);
 
       if (backgroundMode) {
-        emitBackgroundHandshake({ port, url, pid: process.pid });
+        announceBackgroundReview(getReviewSnapshot());
         if (isBackgroundChild) {
           ignoreStdioErrorsForBackgroundDaemon();
         }
         return;
       }
 
-      console.log(`\n🚀 difit server started on ${url}`);
+      console.log(`\n🚀 difit server started on ${reportedUrl}`);
       console.log(`📋 Reviewing: ${selection.targetCommitish}`);
 
       if (options.keepAlive) {
@@ -337,36 +421,37 @@ program
         console.log(
           '\n! \x1b[33mNo differences found. Browser will not open automatically.\x1b[0m',
         );
-        console.log(`   Server is running at ${url} if you want to check manually.\n`);
+        console.log(`   Server is running at ${reportedUrl} if you want to check manually.\n`);
       } else if (options.open) {
         console.log('🌐 Opening browser...\n');
       } else {
         console.log('💡 Use --open to automatically open browser\n');
       }
-
-      process.on('SIGINT', async () => {
-        console.log('\n👋 Shutting down difit server...');
-
-        // Try to fetch comments before shutting down
-        try {
-          const response = await fetch(`http://localhost:${port}/api/comments-output`);
-          if (response.ok) {
-            const data = await response.text();
-            if (data.trim()) {
-              console.log(data);
-            }
-          }
-        } catch {
-          // Silently ignore fetch errors during shutdown
-        }
-
-        process.exit(0);
-      });
     } catch (error) {
       console.error('Error:', error instanceof Error ? error.message : 'Unknown error');
       process.exit(1);
     }
   });
+
+/**
+ * Hand the parent everything it needs to reach this review, once the listener, the store, the
+ * mutation routes and the completion timers are all live. Exactly one JSON document goes out; the
+ * review itself is read back over REST, never from this stream.
+ *
+ * Every field comes from the snapshot, so what the launcher prints and what `/api/session`
+ * reports cannot drift apart.
+ */
+function announceBackgroundReview(snapshot: ReviewSnapshot): void {
+  emitBackgroundHandshake({
+    sessionId: snapshot.session.sessionId,
+    port: snapshot.session.port,
+    pid: snapshot.session.pid,
+    publicUrl: snapshot.session.publicUrl,
+    apiUrl: snapshot.session.apiUrl,
+    url: snapshot.session.publicUrl,
+    cursor: 0,
+  });
+}
 
 void program.parseAsync();
 

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 import { StorageService } from './StorageService';
+import type { PendingReviewEdit } from '../utils/reviewEdits';
 
 // Mock localStorage with proper Storage interface
 class LocalStorageMock implements Storage {
@@ -266,6 +267,104 @@ describe('StorageService - Repository Isolation', () => {
       expect(keys).toContain('difit-storage-v1/repo-1/abc123-WORKING-merge-base');
       expect(keys.some((key: string) => key.endsWith('-direct'))).toBe(false);
     });
+  });
+});
+
+describe('StorageService - Review drafts', () => {
+  let service: StorageService;
+
+  beforeEach(() => {
+    localStorage.clear();
+    service = new StorageService();
+  });
+
+  it('keeps queued edits isolated to one process session and selection', () => {
+    const edits: PendingReviewEdit[] = [
+      {
+        kind: 'setResolved',
+        threadId: 'thread-1',
+        before: false,
+        resolved: true,
+        updatedAt: '2026-09-05T10:00:00.000Z',
+      },
+    ];
+
+    service.saveReviewDraft('review-1', 'repo:base...target', edits);
+
+    expect(service.getReviewDraft('review-1', 'repo:base...target')).toEqual(edits);
+    expect(service.getReviewDraft('review-2', 'repo:base...target')).toBeNull();
+    expect(service.getReviewDraft('review-1', 'repo:other-base...target')).toBeNull();
+  });
+
+  it('drops a draft whose entries are missing the fields they are replayed through', () => {
+    localStorage.setItem(
+      'difit-review-draft-v1/review-1/repo%3Abase...target',
+      JSON.stringify([{ kind: 'createThread' }]),
+    );
+
+    expect(service.getReviewDraft('review-1', 'repo:base...target')).toBeNull();
+  });
+
+  it('drops a draft whose thread lacks the position and messages the replay reads', () => {
+    localStorage.setItem(
+      'difit-review-draft-v1/review-1/repo%3Abase...target',
+      JSON.stringify([{ kind: 'createThread', thread: { id: 'x' } }]),
+    );
+
+    expect(service.getReviewDraft('review-1', 'repo:base...target')).toBeNull();
+    expect(service.getReviewDraftsForSelection('repo:base...target')).toEqual([]);
+  });
+
+  it('drops a draft whose recorded previous value is null rather than a message', () => {
+    localStorage.setItem(
+      'difit-review-draft-v1/review-1/repo%3Abase...target',
+      JSON.stringify([{ kind: 'deleteMessage', threadId: 'thread-1', before: null }]),
+    );
+
+    expect(service.getReviewDraft('review-1', 'repo:base...target')).toBeNull();
+  });
+
+  it('finds a draft left by an earlier review process for the same selection', () => {
+    const edits: PendingReviewEdit[] = [
+      {
+        kind: 'setResolved',
+        threadId: 'thread-1',
+        before: false,
+        resolved: true,
+        updatedAt: '2026-09-05T10:00:00.000Z',
+      },
+    ];
+    service.saveReviewDraft('review-1', 'repo:base...target', edits);
+    service.saveReviewDraft('review-1', 'repo:other...target', edits);
+
+    expect(service.getReviewDraftsForSelection('repo:base...target')).toEqual([
+      { sessionId: 'review-1', edits },
+    ]);
+    expect(service.getReviewDraftsForSelection('repo:absent...target')).toEqual([]);
+  });
+
+  it('carries a thread resolution through a storage round trip', () => {
+    const thread = {
+      id: 'thread-1',
+      resolved: true,
+      filePath: 'file.ts',
+      createdAt: '2026-09-05T10:00:00.000Z',
+      updatedAt: '2026-09-05T10:00:00.000Z',
+      position: { side: 'new' as const, line: 1 },
+      messages: [
+        {
+          id: 'm1',
+          body: 'Please fix this',
+          author: 'User',
+          createdAt: '2026-09-05T10:00:00.000Z',
+          updatedAt: '2026-09-05T10:00:00.000Z',
+        },
+      ],
+    };
+
+    service.saveCommentThreads('HEAD^', 'HEAD', [thread]);
+
+    expect(service.getCommentThreads('HEAD^', 'HEAD')).toEqual([thread]);
   });
 });
 

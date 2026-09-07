@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
 import {
   type DiffCommentThread,
+  type DiffCommentMessage,
   type DiffResponse,
   type DiffSelection,
   type DiffViewMode,
@@ -11,7 +12,12 @@ import {
   type CommentThread,
   type RevisionsResponse,
 } from '../types/diff';
+import type { ReviewReason, ReviewThread } from '../types/review';
 import { DEFAULT_DIFF_VIEW_MODE, normalizeDiffViewMode } from '../utils/diffMode';
+import {
+  formatAllCommentThreadsPrompt,
+  formatCommentThreadPrompt,
+} from '../utils/commentFormatting';
 import { mergeCommentThreads } from '../utils/commentImports';
 import {
   createDiffSelection,
@@ -36,6 +42,7 @@ import { SparkleAnimation } from './components/SparkleAnimation';
 import { WordHighlightProvider } from './contexts/WordHighlightContext';
 import { useAppearanceSettings } from './hooks/useAppearanceSettings';
 import { useDiffComments } from './hooks/useDiffComments';
+import { normalizeReviewThreads, useReviewSync } from './hooks/useReviewSync';
 import { useExpandedLines, type MergedChunk } from './hooks/useExpandedLines';
 import { useFileWatch } from './hooks/useFileWatch';
 import { useKeyboardNavigation } from './hooks/useKeyboardNavigation';
@@ -45,6 +52,7 @@ import { useViewport } from './hooks/useViewport';
 import { fetchClientSettings, saveClientSettings } from './services/userSettings';
 import { hasMultipleCommentAuthors } from './utils/commentAuthors';
 import { copyTextToClipboard } from './utils/clipboard';
+import { createId } from '../utils/createId';
 import { getFileElementId } from './utils/domUtils';
 import { findCommentPosition } from './utils/navigation/positionHelpers';
 import { resolveEventSourceUrl } from './utils/eventSourceUrl';
@@ -54,6 +62,8 @@ import {
   getMergedChunksForVersion,
 } from './utils/mergedChunks';
 import { buildFileLineIndex, isThreadOutdated } from './utils/outdatedComments';
+import { applyReviewEdits } from './utils/reviewEdits';
+import type { PendingReviewEdit } from './utils/reviewEdits';
 
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
 const EMPTY_MERGED_CHUNKS: MergedChunk[] = [];
@@ -63,6 +73,70 @@ const SIDEBAR_OPEN_STORAGE_KEY = 'difit.sidebarOpen';
 const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 600;
 const SIDEBAR_DEFAULT_WIDTH = 280;
+
+/** Say why a review stopped accepting input, in the reader's terms rather than the wire enum. */
+const describeReviewReason = (reason: ReviewReason | null): string => {
+  switch (reason) {
+    case 'browser_idle':
+      return 'no browser was connected, so the review finished';
+    case 'review_timeout':
+      return 'the review reached its time limit';
+    case 'agent_stop':
+      return 'the agent ended the review';
+    case null:
+      return 'this review is no longer active';
+  }
+};
+
+/** Format pending review work as text a person can copy after the review input closes. */
+const formatPendingReviewDraft = (
+  edits: PendingReviewEdit[],
+  serverThreads: ReviewThread[],
+): string => {
+  const location = (thread: ReviewThread | undefined, threadId: string) => {
+    if (!thread) return `Thread ${threadId}`;
+    const line =
+      typeof thread.position.line === 'number'
+        ? String(thread.position.line)
+        : `${thread.position.line.start}-${thread.position.line.end}`;
+    return `${thread.filePath}:${line}`;
+  };
+
+  return edits
+    .map((edit) => {
+      switch (edit.kind) {
+        case 'createThread':
+          return `${location(edit.thread, edit.thread.id)}\n${edit.thread.messages
+            .map((message) => message.body)
+            .join('\n')}`;
+        case 'reply':
+          return `${location(
+            serverThreads.find((thread) => thread.id === edit.threadId),
+            edit.threadId,
+          )}\n${edit.message.body}`;
+        case 'editMessage':
+          return `${location(
+            serverThreads.find((thread) => thread.id === edit.threadId),
+            edit.threadId,
+          )}\n${edit.body}`;
+        case 'deleteMessage':
+          return `${location(
+            serverThreads.find((thread) => thread.id === edit.threadId),
+            edit.threadId,
+          )}\n${edit.before.body}`;
+        case 'deleteThread':
+          return `${location(edit.before, edit.before.id)}\n${edit.before.messages
+            .map((message) => message.body)
+            .join('\n')}`;
+        case 'setResolved':
+          return `${location(
+            serverThreads.find((thread) => thread.id === edit.threadId),
+            edit.threadId,
+          )}\n${edit.resolved ? 'Resolve thread' : 'Reopen thread'}`;
+      }
+    })
+    .join('\n\n');
+};
 
 const parseDiffViewMode = (value: unknown): DiffViewMode | null => {
   switch (value) {
@@ -193,8 +267,6 @@ function App() {
     removeMessage,
     updateMessage,
     clearAllComments,
-    generateThreadPrompt,
-    generateAllCommentsPrompt,
   } = useDiffComments(
     resolvedSelection?.baseCommitish,
     resolvedSelection?.targetCommitish,
@@ -204,7 +276,11 @@ function App() {
     resolvedSelection?.baseMode,
   );
 
-  const showMobileCommentsBar = isMobile && threads.length > 0;
+  // The static bootstrap reads the local collection once, without taking a dependency that would
+  // make it re-run every time it replaces that same collection.
+  const threadsRef = useRef(threads);
+  threadsRef.current = threads;
+
   const commentsContextKey = useMemo(() => {
     if (!resolvedSelectionKey) {
       return null;
@@ -236,67 +312,83 @@ function App() {
     },
     [commentSessionQueryString],
   );
+  const [reviewServerThreads, setReviewServerThreads] = useState<ReviewThread[]>([]);
+  const handleServerThreads = useCallback((nextThreads: ReviewThread[]) => {
+    setReviewServerThreads(nextThreads);
+  }, []);
+  // A static viewer adopts the server collection into its own local state. Suppresses the echo
+  // write that adoption would otherwise trigger, so an adopted collection is not posted straight
+  // back to the server.
+  const skipNextStaticSyncRef = useRef(false);
+  const adoptedServerThreadsRef = useRef<string | null>(null);
+  const {
+    session: reviewSession,
+    version: reviewServerVersion,
+    pending: reviewPending,
+    status: reviewStatus,
+    enqueue: enqueueReviewEdit,
+    refresh: refreshReview,
+    retry: retryReview,
+    discard: discardReviewDraft,
+  } = useReviewSync({
+    contextKey: commentsContextKey ?? '',
+    readUrl: getCommentApiUrl('/api/comments-json'),
+    writeUrl: getCommentApiUrl('/api/comments'),
+    onServerThreads: handleServerThreads,
+  });
+  // The server version a static viewer last saw, echoed back as baseVersion so the server merges
+  // rather than overwrites when another writer changed the collection since that read. Held in a
+  // ref: the sync effect must not re-run, and so re-post, each time the version moves. Copied in
+  // an effect rather than during render so a fresher version taken from a write's own answer is
+  // not overwritten by a re-render that still holds the older read.
+  const staticServerVersionRef = useRef<number | null>(null);
+  useEffect(() => {
+    staticServerVersionRef.current = reviewServerVersion;
+  }, [reviewServerVersion]);
+  const commentsContextKeyRef = useRef(commentsContextKey);
+  commentsContextKeyRef.current = commentsContextKey;
+  const isSelectedReview = reviewSession !== null;
+  const hasAuthoritativeStaticBootstrap = reviewSession === null && reviewStatus === 'saved';
+  const { reviewProjection, unappliedReviewEdits } = useMemo(() => {
+    const result = applyReviewEdits(reviewServerThreads, reviewPending);
+    if (result.ok) return { reviewProjection: result.threads, unappliedReviewEdits: 0 };
+
+    // One edit conflicts; the ones queued before it still apply. Showing the bare server state
+    // instead would make every other piece of the user's pending work vanish from the page, so
+    // project the prefix and say how much of the queue is not represented.
+    const applied = applyReviewEdits(
+      reviewServerThreads,
+      reviewPending.slice(0, result.conflictIndex),
+    );
+    return {
+      reviewProjection: applied.ok ? applied.threads : reviewServerThreads,
+      unappliedReviewEdits: applied.ok
+        ? reviewPending.length - result.conflictIndex
+        : reviewPending.length,
+    };
+  }, [reviewServerThreads, reviewPending]);
+  const displayedThreads = isSelectedReview ? reviewProjection : threads;
+  const commentsInputClosed =
+    reviewStatus === 'loading' ||
+    (isSelectedReview && (reviewSession?.state === 'finished' || reviewStatus === 'closed'));
+  const reviewReadFailed = reviewStatus === 'error';
+  const reviewInputClosedReason =
+    !isSelectedReview || !commentsInputClosed
+      ? null
+      : reviewSession?.state === 'finished'
+        ? describeReviewReason(reviewSession.reason)
+        : 'work from an earlier review of these revisions is still waiting; copy or discard it to carry on';
+  const showMobileCommentsBar = isMobile && displayedThreads.length > 0;
   const [bootstrappedCommentsKey, setBootstrappedCommentsKey] = useState<string | null>(null);
   const hasBootstrappedComments =
     commentsContextKey !== null && commentsContextKey === bootstrappedCommentsKey;
-  const bootstrappingCommentsKeyRef = useRef<string | null>(null);
-  const skipNextCommentSyncRef = useRef(false);
-  // Last server comment version seen; echoed back as baseVersion so the server can detect concurrent writes.
-  const serverCommentVersionRef = useRef<number | null>(null);
   const pendingBootstrapAfterLocalResetRef = useRef(false);
 
   useEffect(() => {
     if (commentsContextKey !== bootstrappedCommentsKey) {
-      skipNextCommentSyncRef.current = false;
+      skipNextStaticSyncRef.current = false;
     }
   }, [bootstrappedCommentsKey, commentsContextKey]);
-
-  const fetchServerThreads = useCallback(async (): Promise<DiffCommentThread[]> => {
-    const response = await fetch(getCommentApiUrl('/api/comments-json'));
-    if (!response.ok) {
-      throw new Error(`Failed to fetch comments: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as {
-      version?: number;
-      threads?: DiffCommentThread[];
-    };
-    if (typeof payload.version === 'number') {
-      serverCommentVersionRef.current = payload.version;
-    }
-    return Array.isArray(payload.threads) ? payload.threads : [];
-  }, [getCommentApiUrl]);
-
-  const syncThreadsToServer = useCallback(
-    async (nextThreads: DiffCommentThread[]) => {
-      const response = await fetch(getCommentApiUrl('/api/comments'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          threads: nextThreads,
-          baseVersion: serverCommentVersionRef.current ?? undefined,
-        }),
-      });
-      if (!response.ok) {
-        return;
-      }
-
-      const result = (await response.json()) as {
-        version?: number;
-        merged?: boolean;
-        threads?: DiffCommentThread[];
-      };
-      if (typeof result.version === 'number') {
-        serverCommentVersionRef.current = result.version;
-      }
-      // Server merged in a concurrent change; adopt it so we don't push a stale set back.
-      if (result.merged && Array.isArray(result.threads)) {
-        skipNextCommentSyncRef.current = true;
-        replaceThreads(result.threads);
-      }
-    },
-    [getCommentApiUrl, replaceThreads],
-  );
 
   // Viewed files management
   const {
@@ -513,8 +605,9 @@ function App() {
 
   const normalizedThreads = useMemo<CommentThread[]>(
     () =>
-      threads.map((thread) => ({
+      displayedThreads.map((thread) => ({
         id: thread.id,
+        resolved: thread.resolved,
         file: thread.filePath,
         line:
           typeof thread.position.line === 'number'
@@ -527,7 +620,7 @@ function App() {
         isOutdated: isThreadOutdated(thread, fileLineIndexByPath.get(thread.filePath)),
         messages: thread.messages,
       })),
-    [threads, fileLineIndexByPath],
+    [displayedThreads, fileLineIndexByPath],
   );
   const showAuthorBadges = useMemo(
     () => hasMultipleCommentAuthors(normalizedThreads.flatMap((thread) => thread.messages)),
@@ -556,18 +649,64 @@ function App() {
   const handleWatchReload = useCallback(async () => {
     await fetchDiffDataRef.current?.();
   }, []);
-  const handleCommentsChanged = useCallback(async () => {
-    try {
-      const serverThreads = await fetchServerThreads();
-      skipNextCommentSyncRef.current = true;
-      replaceThreads(serverThreads);
-      if (commentsContextKey) {
-        setBootstrappedCommentsKey(commentsContextKey);
+  const syncStaticThreadsToServer = useCallback(
+    async (nextThreads: DiffCommentThread[]) => {
+      const contextKey = commentsContextKeyRef.current;
+      const response = await fetch(getCommentApiUrl('/api/comments'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          threads: nextThreads,
+          baseVersion: staticServerVersionRef.current ?? undefined,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to save comments: ${response.status} ${response.statusText}`);
       }
-    } catch (commentsError) {
-      console.error('Failed to refresh comments from server:', commentsError);
+      const result = (await response.json()) as {
+        version?: number;
+        merged?: boolean;
+        threads?: DiffCommentThread[];
+      };
+      // The selection moved on while this write was outstanding; its answer belongs to the old one.
+      if (contextKey !== commentsContextKeyRef.current) return;
+      if (typeof result.version === 'number') {
+        staticServerVersionRef.current = result.version;
+      }
+      // The server merged a concurrent change into this write. Adopt its result so the next write
+      // does not push the stale local set back over it.
+      if (result.merged && Array.isArray(result.threads)) {
+        const merged = normalizeReviewThreads(result.threads);
+        adoptedServerThreadsRef.current = JSON.stringify(merged);
+        skipNextStaticSyncRef.current = true;
+        replaceThreads(merged);
+      }
+    },
+    [getCommentApiUrl, replaceThreads],
+  );
+  // The watch EventSource captures its handlers once, so this indirection keeps notifications
+  // pointed at the current selection's refresh rather than the one from the first render.
+  const refreshCommentsRef = useRef(refreshReview);
+  refreshCommentsRef.current = refreshReview;
+  const handleCommentsChanged = useCallback(async () => {
+    await refreshCommentsRef.current();
+  }, []);
+  const clearCommentsForCurrentMode = useCallback(() => {
+    if (commentsInputClosed) return;
+    if (isSelectedReview) {
+      reviewProjection.forEach((thread) => {
+        enqueueReviewEdit({ kind: 'deleteThread', before: thread });
+      });
+      return;
     }
-  }, [commentsContextKey, fetchServerThreads, replaceThreads]);
+    clearAllComments();
+  }, [
+    clearAllComments,
+    commentsInputClosed,
+    isSelectedReview,
+    reviewProjection,
+    enqueueReviewEdit,
+  ]);
 
   // File watch for reload functionality - initialize with callback
   const { shouldReload, reload, watchState } = useFileWatch(
@@ -597,13 +736,13 @@ function App() {
         }
       },
       onCopyAllComments: () => {
-        if (threads.length > 0) {
+        if (displayedThreads.length > 0) {
           void handleCopyAllComments();
         }
       },
       onDeleteAllComments: () => {
-        if (threads.length > 0 && confirm('Delete all comments?')) {
-          clearAllComments();
+        if (displayedThreads.length > 0 && confirm('Delete all comments?')) {
+          clearCommentsForCurrentMode();
         }
       },
       onShowCommentsList: () => {
@@ -658,9 +797,11 @@ function App() {
     setCommentTrigger(null);
   }, [setCommentTrigger]);
 
+  // Format the thread exactly as displayed. In a review the local comment store is never
+  // populated, so looking the thread up there by id would yield an empty prompt.
   const handleGenerateThreadPrompt = useCallback(
-    (thread: CommentThread) => generateThreadPrompt(thread.id),
-    [generateThreadPrompt],
+    (thread: CommentThread) => formatCommentThreadPrompt(thread),
+    [],
   );
 
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -901,8 +1042,12 @@ function App() {
     }
   }, [diffData?.clearComments, clearAllComments, clearViewedFiles]);
 
+  // Reconcile the static viewer's stored threads with the server's collection exactly once per
+  // selection. This runs synchronously: it used to await the follow-up write, and a render during
+  // that await cancelled the run before it could mark the selection bootstrapped, so the effect
+  // re-entered and wrote the same merge again, without end.
   useEffect(() => {
-    if (!commentsContextKey || !hasLoadedComments) {
+    if (!commentsContextKey || !hasLoadedComments || !hasAuthoritativeStaticBootstrap) {
       return;
     }
 
@@ -910,65 +1055,32 @@ function App() {
       return;
     }
 
-    if (bootstrappingCommentsKeyRef.current === commentsContextKey) {
-      return;
-    }
-
     const shouldReplaceFromServer = pendingBootstrapAfterLocalResetRef.current;
     pendingBootstrapAfterLocalResetRef.current = false;
 
-    bootstrappingCommentsKeyRef.current = commentsContextKey;
-    let cancelled = false;
+    const serverCollection = JSON.stringify(reviewServerThreads);
+    const nextThreads = shouldReplaceFromServer
+      ? reviewServerThreads
+      : mergeCommentThreads(reviewServerThreads, threadsRef.current).threads;
 
-    const bootstrapComments = async () => {
-      try {
-        const serverThreads = await fetchServerThreads();
-        const nextThreads = shouldReplaceFromServer
-          ? serverThreads
-          : mergeCommentThreads(serverThreads, threads).threads;
-        if (cancelled) {
-          return;
-        }
+    adoptedServerThreadsRef.current = serverCollection;
+    skipNextStaticSyncRef.current = true;
+    replaceThreads(nextThreads);
+    setBootstrappedCommentsKey(commentsContextKey);
 
-        skipNextCommentSyncRef.current = true;
-        replaceThreads(nextThreads);
-
-        if (
-          !shouldReplaceFromServer &&
-          JSON.stringify(serverThreads) !== JSON.stringify(nextThreads)
-        ) {
-          await syncThreadsToServer(nextThreads);
-        }
-      } catch (commentsError) {
-        if (!cancelled) {
-          console.error('Failed to bootstrap comments from server:', commentsError);
-        }
-      } finally {
-        if (!cancelled) {
-          setBootstrappedCommentsKey(commentsContextKey);
-        }
-        if (bootstrappingCommentsKeyRef.current === commentsContextKey) {
-          bootstrappingCommentsKeyRef.current = null;
-        }
-      }
-    };
-
-    void bootstrapComments();
-
-    return () => {
-      cancelled = true;
-      if (bootstrappingCommentsKeyRef.current === commentsContextKey) {
-        bootstrappingCommentsKeyRef.current = null;
-      }
-    };
+    if (!shouldReplaceFromServer && serverCollection !== JSON.stringify(nextThreads)) {
+      syncStaticThreadsToServer(nextThreads).catch((commentsError) => {
+        console.error('Failed to bootstrap comments to the server:', commentsError);
+      });
+    }
   }, [
     bootstrappedCommentsKey,
     commentsContextKey,
-    fetchServerThreads,
+    hasAuthoritativeStaticBootstrap,
     hasLoadedComments,
     replaceThreads,
-    syncThreadsToServer,
-    threads,
+    reviewServerThreads,
+    syncStaticThreadsToServer,
   ]);
 
   // Trigger sparkle animation when all files are viewed
@@ -990,41 +1102,91 @@ function App() {
     }
   }, [viewedFiles.size, diffData, hasTriggeredSparkles]);
 
-  // Send comments to server whenever they change and before page unload
+  // A static viewer adopts a collection another client changed, the way it did before reviews had
+  // their own store. The bootstrap effect owns the first collection, so only a later refresh is
+  // adopted here, and the adopted collection is not echoed straight back to the server.
   useEffect(() => {
-    if (!hasBootstrappedComments) {
+    if (!hasBootstrappedComments || !hasAuthoritativeStaticBootstrap) {
+      return;
+    }
+    const serverCollection = JSON.stringify(reviewServerThreads);
+    if (
+      adoptedServerThreadsRef.current === null ||
+      adoptedServerThreadsRef.current === serverCollection
+    ) {
       return;
     }
 
-    const data = JSON.stringify({
-      threads,
-      baseVersion: serverCommentVersionRef.current ?? undefined,
-    });
+    adoptedServerThreadsRef.current = serverCollection;
+    skipNextStaticSyncRef.current = true;
+    replaceThreads(reviewServerThreads);
+  }, [
+    hasAuthoritativeStaticBootstrap,
+    hasBootstrappedComments,
+    replaceThreads,
+    reviewServerThreads,
+  ]);
+
+  // Queued review work lives only in this browser until the server acknowledges it, so leaving the
+  // page has to be an explicit choice. The draft is also written to storage, but a warning is what
+  // gives the user the chance not to need it.
+  useEffect(() => {
+    if (!isSelectedReview || (reviewPending.length === 0 && reviewStatus !== 'saving')) {
+      return undefined;
+    }
+
+    const warnAboutUnsavedReview = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      // Safari and older Chrome still require this to raise the prompt at all.
+      event.returnValue = '';
+    };
+
+    window.addEventListener('beforeunload', warnAboutUnsavedReview);
+    return () => {
+      window.removeEventListener('beforeunload', warnAboutUnsavedReview);
+    };
+  }, [isSelectedReview, reviewPending.length, reviewStatus]);
+
+  // Static viewers retain their legacy local synchronization once the server has authoritatively
+  // identified the selection as non-review. Selected reviews are owned by useReviewSync instead.
+  useEffect(() => {
+    if (!hasBootstrappedComments || !hasAuthoritativeStaticBootstrap) {
+      return;
+    }
+
     const commentsApiUrl = getCommentApiUrl('/api/comments');
 
-    // Also handle page unload
     const sendCommentsBeforeUnload = () => {
-      // Use sendBeacon for reliable delivery during page unload, including empty states.
-      navigator.sendBeacon(commentsApiUrl, data);
+      // Serialized at unload so the beacon carries the version a later write answer moved to.
+      navigator.sendBeacon(
+        commentsApiUrl,
+        JSON.stringify({ threads, baseVersion: staticServerVersionRef.current ?? undefined }),
+      );
     };
 
     window.addEventListener('beforeunload', sendCommentsBeforeUnload);
 
-    if (skipNextCommentSyncRef.current) {
-      skipNextCommentSyncRef.current = false;
+    if (skipNextStaticSyncRef.current) {
+      skipNextStaticSyncRef.current = false;
       return () => {
         window.removeEventListener('beforeunload', sendCommentsBeforeUnload);
       };
     }
 
-    syncThreadsToServer(threads).catch((syncError) => {
+    syncStaticThreadsToServer(threads).catch((syncError) => {
       console.error('Failed to sync comments:', syncError);
     });
 
     return () => {
       window.removeEventListener('beforeunload', sendCommentsBeforeUnload);
     };
-  }, [getCommentApiUrl, hasBootstrappedComments, syncThreadsToServer, threads]);
+  }, [
+    getCommentApiUrl,
+    hasAuthoritativeStaticBootstrap,
+    hasBootstrappedComments,
+    syncStaticThreadsToServer,
+    threads,
+  ]);
 
   // Establish SSE connection for tab close detection
   useEffect(() => {
@@ -1057,6 +1219,35 @@ function App() {
       codeContent?: string,
       side?: DiffSide,
     ): Promise<void> => {
+      if (commentsInputClosed) return Promise.resolve();
+      if (isSelectedReview) {
+        const now = new Date().toISOString();
+        const id = createId();
+        const message: DiffCommentMessage = {
+          id,
+          body,
+          author: 'User',
+          createdAt: now,
+          updatedAt: now,
+        };
+        enqueueReviewEdit({
+          kind: 'createThread',
+          thread: {
+            id,
+            filePath: file,
+            resolved: false,
+            createdAt: now,
+            updatedAt: now,
+            position: {
+              side: side || 'new',
+              line: typeof line === 'number' ? line : { start: line[0], end: line[1] },
+            },
+            ...(codeContent === undefined ? {} : { codeSnapshot: { content: codeContent } }),
+            messages: [message],
+          },
+        });
+        return Promise.resolve();
+      }
       addThread({
         filePath: file,
         body,
@@ -1072,12 +1263,12 @@ function App() {
       });
       return Promise.resolve();
     },
-    [addThread],
+    [addThread, commentsInputClosed, isSelectedReview, enqueueReviewEdit],
   );
 
   const handleCopyAllComments = async () => {
     try {
-      const prompt = generateAllCommentsPrompt({
+      const prompt = formatAllCommentThreadsPrompt(normalizedThreads, {
         requestedBaseCommitish: diffData?.requestedBaseCommitish,
         requestedTargetCommitish: diffData?.requestedTargetCommitish,
         baseMode: normalizeBaseMode(diffData?.requestedBaseMode),
@@ -1092,12 +1283,103 @@ function App() {
     }
   };
 
+  const handleCopyPendingReviewDraft = useCallback(async () => {
+    const draft = formatPendingReviewDraft(reviewPending, reviewServerThreads);
+    if (!draft) return;
+    try {
+      await copyTextToClipboard(draft);
+    } catch (error) {
+      console.error('Failed to copy pending review draft:', error);
+    }
+  }, [reviewServerThreads, reviewPending]);
+
   const handleReplyToThread = useCallback(
     (threadId: string, body: string): Promise<void> => {
+      if (commentsInputClosed) return Promise.resolve();
+      if (isSelectedReview) {
+        const now = new Date().toISOString();
+        enqueueReviewEdit({
+          kind: 'reply',
+          threadId,
+          message: {
+            id: createId(),
+            body,
+            author: 'User',
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+        return Promise.resolve();
+      }
       replyToThread({ threadId, body });
       return Promise.resolve();
     },
-    [replyToThread],
+    [commentsInputClosed, isSelectedReview, replyToThread, enqueueReviewEdit],
+  );
+
+  const handleRemoveThread = useCallback(
+    (threadId: string) => {
+      if (commentsInputClosed) return;
+      if (isSelectedReview) {
+        const thread = reviewProjection.find((item) => item.id === threadId);
+        if (thread) enqueueReviewEdit({ kind: 'deleteThread', before: thread });
+        return;
+      }
+      removeThread(threadId);
+    },
+    [commentsInputClosed, isSelectedReview, removeThread, reviewProjection, enqueueReviewEdit],
+  );
+
+  const handleRemoveMessage = useCallback(
+    (threadId: string, messageId: string) => {
+      if (commentsInputClosed) return;
+      if (isSelectedReview) {
+        const thread = reviewProjection.find((item) => item.id === threadId);
+        const message = thread?.messages.find((item) => item.id === messageId);
+        if (message) enqueueReviewEdit({ kind: 'deleteMessage', threadId, before: message });
+        return;
+      }
+      removeMessage(threadId, messageId);
+    },
+    [commentsInputClosed, isSelectedReview, removeMessage, reviewProjection, enqueueReviewEdit],
+  );
+
+  const handleUpdateMessage = useCallback(
+    (threadId: string, messageId: string, body: string) => {
+      if (commentsInputClosed) return;
+      if (isSelectedReview) {
+        const thread = reviewProjection.find((item) => item.id === threadId);
+        const before = thread?.messages.find((item) => item.id === messageId);
+        if (before) {
+          enqueueReviewEdit({
+            kind: 'editMessage',
+            threadId,
+            before,
+            body,
+            updatedAt: new Date().toISOString(),
+          });
+        }
+        return;
+      }
+      updateMessage(threadId, messageId, body);
+    },
+    [commentsInputClosed, isSelectedReview, reviewProjection, enqueueReviewEdit, updateMessage],
+  );
+
+  const handleSetResolved = useCallback(
+    (threadId: string, resolved: boolean) => {
+      if (commentsInputClosed || !isSelectedReview) return;
+      const thread = reviewProjection.find((item) => item.id === threadId);
+      if (!thread) return;
+      enqueueReviewEdit({
+        kind: 'setResolved',
+        threadId,
+        before: thread.resolved,
+        resolved,
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    [commentsInputClosed, isSelectedReview, reviewProjection, enqueueReviewEdit],
   );
 
   const handleNavigateToComment = (thread: CommentThread) => {
@@ -1310,12 +1592,69 @@ function App() {
                 isMobile ? 'gap-3' : 'gap-4'
               }`}
             >
-              {!isMobile && threads.length > 0 && (
+              {reviewReadFailed && (
+                <div className="text-xs text-github-warning" role="status">
+                  {isSelectedReview
+                    ? 'Could not reach the review server. What is shown may be out of date, and new changes stay in this browser until a save reaches it.'
+                    : 'Could not reach the server. Comments made now are kept in this browser only and will not reach a review.'}
+                </div>
+              )}
+              {isSelectedReview && reviewStatus !== 'saved' && (
+                <div
+                  className="flex items-center gap-2 text-xs text-github-text-secondary"
+                  role="status"
+                >
+                  <span>
+                    {reviewStatus === 'saving'
+                      ? 'Saving review changes'
+                      : reviewStatus === 'conflict'
+                        ? unappliedReviewEdits === 0
+                          ? 'Review conflict'
+                          : `Review conflict: ${unappliedReviewEdits} queued change${
+                              unappliedReviewEdits === 1 ? '' : 's'
+                            } not shown below`
+                        : reviewStatus === 'closed'
+                          ? 'Review input closed'
+                          : 'Unsaved changes'}
+                  </span>
+                  {reviewPending.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyPendingReviewDraft()}
+                      className="rounded border border-github-border px-2 py-1 hover:bg-github-bg-primary"
+                    >
+                      Copy draft
+                    </button>
+                  )}
+                  {reviewPending.length > 0 &&
+                    reviewStatus !== 'closed' &&
+                    reviewStatus !== 'saving' && (
+                      <button
+                        type="button"
+                        onClick={() => void retryReview()}
+                        className="rounded border border-github-border px-2 py-1 hover:bg-github-bg-primary"
+                      >
+                        Retry
+                      </button>
+                    )}
+                  {reviewPending.length > 0 && reviewStatus !== 'saving' && (
+                    <button
+                      type="button"
+                      onClick={discardReviewDraft}
+                      className="rounded border border-github-border px-2 py-1 hover:bg-github-bg-primary"
+                    >
+                      Discard draft
+                    </button>
+                  )}
+                </div>
+              )}
+              {!isMobile && displayedThreads.length > 0 && (
                 <CommentsDropdown
-                  commentsCount={threads.length}
+                  commentsCount={displayedThreads.length}
                   isCopiedAll={isCopiedAll}
                   onCopyAll={handleCopyAllComments}
-                  onDeleteAll={clearAllComments}
+                  onDeleteAll={clearCommentsForCurrentMode}
+                  canDeleteAll={!commentsInputClosed}
                   onViewAll={() => setIsCommentsListOpen(true)}
                 />
               )}
@@ -1516,10 +1855,13 @@ function App() {
                       onToggleAllCollapsed={toggleAllFilesCollapsed}
                       onAddComment={handleAddComment}
                       onGenerateThreadPrompt={handleGenerateThreadPrompt}
-                      onRemoveThread={removeThread}
+                      onRemoveThread={handleRemoveThread}
+                      onSetResolved={isSelectedReview ? handleSetResolved : undefined}
                       onReplyToThread={handleReplyToThread}
-                      onRemoveMessage={removeMessage}
-                      onUpdateMessage={updateMessage}
+                      onRemoveMessage={handleRemoveMessage}
+                      onUpdateMessage={handleUpdateMessage}
+                      commentsReadOnly={commentsInputClosed}
+                      reviewInputClosedReason={reviewInputClosedReason}
                       onOpenInEditor={canOpenInEditor ? handleOpenInEditor : undefined}
                       syntaxTheme={settings.syntaxTheme}
                       baseCommitish={diffData.baseCommitish}
@@ -1569,10 +1911,11 @@ function App() {
         {showMobileCommentsBar && (
           <div className="fixed bottom-0 left-0 right-0 z-20 bg-github-bg-secondary border-t border-github-border px-4 py-2 flex justify-end">
             <CommentsDropdown
-              commentsCount={threads.length}
+              commentsCount={displayedThreads.length}
               isCopiedAll={isCopiedAll}
               onCopyAll={handleCopyAllComments}
-              onDeleteAll={clearAllComments}
+              onDeleteAll={clearCommentsForCurrentMode}
+              canDeleteAll={!commentsInputClosed}
               onViewAll={() => setIsCommentsListOpen(true)}
               direction="up"
               compact
@@ -1597,11 +1940,14 @@ function App() {
           onNavigate={handleNavigateToComment}
           comments={normalizedThreads}
           showAuthorBadges={showAuthorBadges}
-          onRemoveThread={removeThread}
+          onRemoveThread={handleRemoveThread}
+          onSetResolved={isSelectedReview ? handleSetResolved : undefined}
           onGenerateThreadPrompt={handleGenerateThreadPrompt}
           onReplyToThread={handleReplyToThread}
-          onRemoveMessage={removeMessage}
-          onUpdateMessage={updateMessage}
+          onRemoveMessage={handleRemoveMessage}
+          onUpdateMessage={handleUpdateMessage}
+          inputClosed={commentsInputClosed}
+          inputClosedReason={reviewInputClosedReason}
           syntaxTheme={settings.syntaxTheme}
         />
       </div>

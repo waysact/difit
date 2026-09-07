@@ -133,9 +133,16 @@ function normalizeCommentImportEntry(value: unknown): CommentImport {
 
   const createdAt = normalizeTimestamp(value.createdAt, 'createdAt');
   const updatedAt = normalizeTimestamp(value.updatedAt, 'updatedAt');
+  if (
+    value.resolved !== undefined &&
+    (value.type !== 'thread' || typeof value.resolved !== 'boolean')
+  ) {
+    throw new Error('Invalid comment import field: resolved');
+  }
 
   const normalized = {
     type: value.type,
+    ...(value.resolved === undefined ? {} : { resolved: value.resolved }),
     id: normalizeOptionalString(value.id, 'id'),
     filePath: value.filePath,
     position: normalizePosition(value.position),
@@ -254,6 +261,7 @@ function createImportedThread(commentImport: ThreadCommentImport, now: string): 
 
   return {
     id: threadId,
+    resolved: commentImport.resolved ?? false,
     filePath: commentImport.filePath,
     createdAt,
     updatedAt,
@@ -327,6 +335,7 @@ function cloneMessage(message: DiffCommentMessage): DiffCommentMessage {
 function cloneThread(thread: DiffCommentThread): DiffCommentThread {
   return {
     id: thread.id,
+    resolved: thread.resolved ?? false,
     filePath: thread.filePath,
     createdAt: thread.createdAt,
     updatedAt: thread.updatedAt,
@@ -457,6 +466,9 @@ export function serializeCommentImports(commentImports: CommentImport[]): string
   return JSON.stringify(
     commentImports.map((commentImport) => ({
       type: commentImport.type,
+      ...(commentImport.type === 'thread' && commentImport.resolved !== undefined
+        ? { resolved: commentImport.resolved }
+        : {}),
       id: commentImport.id,
       filePath: commentImport.filePath,
       position: {

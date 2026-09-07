@@ -121,6 +121,32 @@ describe('FileWatcherService', () => {
       // After stop, adding client should work normally (clients array should be cleared)
       expect(() => fileWatcher.addClient(mockResponse)).not.toThrow();
     });
+
+    it('rejects after attempting every unsubscribe failure', async () => {
+      const failure = new Error('first watcher did not stop');
+      const failedSubscription = { unsubscribe: vi.fn().mockRejectedValue(failure) };
+      const successfulSubscription = { unsubscribe: vi.fn().mockResolvedValue(undefined) };
+      vi.mocked(subscribe)
+        .mockResolvedValueOnce(failedSubscription)
+        .mockResolvedValueOnce(successfulSubscription);
+      await fileWatcher.start(DiffMode.WORKING, TEST_REPO_PATH, 300);
+
+      await expect(fileWatcher.stop()).rejects.toThrow('Failed to stop file watchers');
+      expect(failedSubscription.unsubscribe).toHaveBeenCalledExactlyOnceWith();
+      expect(successfulSubscription.unsubscribe).toHaveBeenCalledExactlyOnceWith();
+    });
+
+    it('propagates a prior cleanup failure when a new watch mode starts', async () => {
+      const failure = new Error('previous watcher did not stop');
+      const failedSubscription = { unsubscribe: vi.fn().mockRejectedValue(failure) };
+      vi.mocked(subscribe).mockResolvedValueOnce(failedSubscription);
+      await fileWatcher.start(DiffMode.DEFAULT, TEST_REPO_PATH, 300);
+
+      await expect(fileWatcher.start(DiffMode.SPECIFIC, TEST_REPO_PATH, 300)).rejects.toThrow(
+        'Failed to stop file watchers',
+      );
+      expect(failedSubscription.unsubscribe).toHaveBeenCalledExactlyOnceWith();
+    });
   });
 
   describe('client management', () => {

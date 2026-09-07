@@ -16,7 +16,7 @@ describe('testHttpUrl', () => {
 
   it.each([null, '/tmp/difit-test.sock'])('rejects non-TCP address %s', (address) => {
     expect(() => testHttpUrl({ address: () => address })).toThrow(
-      'Expected a listening TCP test server',
+      'Expected a listening TCP server',
     );
   });
 });

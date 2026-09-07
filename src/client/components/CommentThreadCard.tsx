@@ -19,7 +19,9 @@ interface ThreadMessageItemProps {
   onUpdate: (newBody: string) => void;
   onResolveOrDelete: () => void;
   actionLabel: string;
+  actionText?: string;
   confirmPrompt?: string;
+  inputClosed?: boolean;
   onClick?: (e: React.MouseEvent) => void;
 }
 
@@ -33,7 +35,9 @@ function ThreadMessageItem({
   onUpdate,
   onResolveOrDelete,
   actionLabel,
+  actionText,
   confirmPrompt,
+  inputClosed = false,
   onClick,
 }: ThreadMessageItemProps) {
   const [isEditing, setIsEditing] = useState(false);
@@ -64,8 +68,15 @@ function ThreadMessageItem({
     return () => document.removeEventListener('keydown', handleKeyDown, true);
   }, [isConfirming]);
 
+  // Closing the review while an editor is open would otherwise leave a Save button whose handler
+  // does nothing; the surrounding card explains why input stopped.
+  useEffect(() => {
+    if (inputClosed) setIsEditing(false);
+  }, [inputClosed]);
+
   const handleStartEdit = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (inputClosed) return;
     setIsEditing(true);
   };
 
@@ -101,7 +112,8 @@ function ThreadMessageItem({
               syntaxTheme={syntaxTheme}
             />
           </div>
-          {(isRootMessage || isUserAuthoredMessage) &&
+          {!inputClosed &&
+            (isRootMessage || isUserAuthoredMessage) &&
             (isConfirming ? (
               <div
                 ref={confirmContainerRef}
@@ -123,7 +135,7 @@ function ThreadMessageItem({
                     isRootMessage ? 'text-green-700 hover:text-green-800' : 'text-github-danger'
                   }`}
                 >
-                  {isRootMessage ? 'Resolve' : 'Delete'}
+                  {actionText ?? (isRootMessage ? 'Resolve' : 'Delete')}
                 </button>
                 <button
                   type="button"
@@ -193,11 +205,14 @@ interface CommentThreadCardProps {
   confirmRootAction?: boolean;
   onGeneratePrompt: (thread: CommentThread) => string;
   onRemoveThread: (threadId: string) => void;
+  onSetResolved?: (threadId: string, resolved: boolean) => void;
   onReplyToThread: (threadId: string, body: string) => Promise<void>;
   onRemoveMessage: (threadId: string, messageId: string) => void;
   onUpdateMessage: (threadId: string, messageId: string, newBody: string) => void;
   onClick?: (e: React.MouseEvent) => void;
   syntaxTheme?: AppearanceSettings['syntaxTheme'];
+  inputClosed?: boolean;
+  inputClosedReason?: string | null;
 }
 
 export function CommentThreadCard({
@@ -206,11 +221,14 @@ export function CommentThreadCard({
   confirmRootAction = true,
   onGeneratePrompt,
   onRemoveThread,
+  onSetResolved,
   onReplyToThread,
   onRemoveMessage,
   onUpdateMessage,
   onClick,
   syntaxTheme,
+  inputClosed = false,
+  inputClosedReason,
 }: CommentThreadCardProps) {
   const [isCopied, setIsCopied] = useState(false);
   const [isReplying, setIsReplying] = useState(false);
@@ -268,6 +286,11 @@ export function CommentThreadCard({
           >
             {thread.file}:{lineLabel}
           </span>
+          {thread.resolved && (
+            <span className="rounded bg-green-100 px-1.5 py-0.5 font-medium text-green-800">
+              Resolved
+            </span>
+          )}
           {thread.isOutdated && (
             <span
               className="inline-flex h-5 shrink-0 items-center rounded-full border border-github-text-muted px-2 text-[10px] font-medium text-github-text-muted"
@@ -321,6 +344,11 @@ export function CommentThreadCard({
 
       {!isCollapsed && (
         <div className="space-y-3">
+          {inputClosedReason && (
+            <p className="rounded border border-github-border bg-github-bg-secondary px-2 py-1 text-xs text-github-text-secondary">
+              Review input closed: {inputClosedReason}
+            </p>
+          )}
           <ThreadMessageItem
             message={rootMessage}
             isRootMessage={true}
@@ -329,9 +357,15 @@ export function CommentThreadCard({
             filename={thread.file}
             originalCode={thread.codeContent}
             onUpdate={(newBody) => onUpdateMessage(thread.id, rootMessage.id, newBody)}
-            onResolveOrDelete={() => onRemoveThread(thread.id)}
-            actionLabel="Resolve thread"
-            confirmPrompt={confirmRootAction ? 'Resolve?' : undefined}
+            onResolveOrDelete={() =>
+              onSetResolved ? onSetResolved(thread.id, !thread.resolved) : onRemoveThread(thread.id)
+            }
+            actionLabel={thread.resolved ? 'Reopen thread' : 'Resolve thread'}
+            actionText={thread.resolved ? 'Reopen' : 'Resolve'}
+            confirmPrompt={
+              confirmRootAction ? (thread.resolved ? 'Reopen?' : 'Resolve?') : undefined
+            }
+            inputClosed={inputClosed}
           />
 
           {thread.messages.slice(1).map((message) => (
@@ -346,6 +380,7 @@ export function CommentThreadCard({
                 onResolveOrDelete={() => onRemoveMessage(thread.id, message.id)}
                 actionLabel="Delete reply"
                 confirmPrompt="Delete?"
+                inputClosed={inputClosed}
               />
             </div>
           ))}
@@ -354,7 +389,7 @@ export function CommentThreadCard({
             className="ml-4 border-l border-github-border pl-3"
             onClick={(e) => e.stopPropagation()}
           >
-            {isReplying ? (
+            {isReplying && !inputClosed ? (
               <CommentForm
                 onSubmit={async (body) => {
                   await onReplyToThread(thread.id, body);
@@ -369,7 +404,7 @@ export function CommentThreadCard({
                 submitLabel="Reply"
                 placeholder="Write a reply..."
               />
-            ) : (
+            ) : !inputClosed ? (
               <button
                 type="button"
                 data-reply-trigger="true"
@@ -379,7 +414,7 @@ export function CommentThreadCard({
               >
                 Write a reply...
               </button>
-            )}
+            ) : null}
           </div>
         </div>
       )}

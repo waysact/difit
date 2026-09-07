@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { must } from '../test/must.js';
 import type { CommentImport, DiffCommentThread } from '../types/diff';
 
 import {
@@ -45,6 +46,52 @@ function createThread({
 }
 
 describe('commentImports', () => {
+  it('preserves resolution and all replies when merging imports', () => {
+    const thread = { ...createThread({ id: 'existing', body: 'Original' }), resolved: true };
+    const rootMessage = must(
+      thread.messages[0],
+      'createThread seeds the thread with its root message',
+    );
+    thread.messages.push({ ...rootMessage, id: 'agent-reply', body: 'Agent reply' });
+    const result = mergeCommentImports(
+      [thread],
+      [
+        {
+          type: 'reply',
+          id: 'new-reply',
+          filePath: thread.filePath,
+          position: thread.position,
+          body: 'New reply',
+        },
+      ],
+    );
+    expect(result.threads[0]?.resolved).toBe(true);
+    expect(result.threads[0]?.messages.map((message) => message.id)).toEqual([
+      'existing',
+      'agent-reply',
+      'new-reply',
+    ]);
+    expect(thread.messages).toHaveLength(2);
+  });
+
+  it('keeps explicit imported resolution through parsing and serialization', () => {
+    const imports = parseCommentImportValue(
+      JSON.stringify({
+        type: 'thread',
+        id: 'closed',
+        filePath: 'a.ts',
+        position: { side: 'new', line: 1 },
+        body: 'Closed',
+        resolved: true,
+      }),
+    );
+    expect(mergeCommentImports([], imports).threads[0]?.resolved).toBe(true);
+    expect(JSON.parse(serializeCommentImports(imports))[0].resolved).toBe(true);
+    expect(() =>
+      parseCommentImportValue(JSON.stringify({ ...imports[0], resolved: 'yes' })),
+    ).toThrow();
+  });
+
   describe('parseCommentImportValue', () => {
     it('parses a single thread import', () => {
       const imports = parseCommentImportValue(

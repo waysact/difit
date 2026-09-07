@@ -4,6 +4,7 @@ import React from 'react';
 import { HotkeysProvider } from 'react-hotkeys-hook';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+import { must } from '../../test/must.js';
 import type { CommentThread } from '../../types/diff';
 
 import { CommentsListModal } from './CommentsListModal';
@@ -269,5 +270,65 @@ describe('CommentsListModal', () => {
     );
 
     expect(screen.getByText('No comments yet')).toBeInTheDocument();
+  });
+
+  it('offers reopen for a resolved thread and routes it through the resolution callback', () => {
+    const onSetResolved = vi.fn();
+    const confirmMock = vi.fn().mockReturnValue(true);
+    vi.stubGlobal('confirm', confirmMock);
+    const firstThread = must(mockThreads[0], 'the fixture list starts with thread-1');
+
+    render(
+      <CommentsListModal
+        isOpen={true}
+        onClose={vi.fn()}
+        onNavigate={vi.fn()}
+        comments={[{ ...firstThread, resolved: true }]}
+        onRemoveThread={mockRemoveThread}
+        onSetResolved={onSetResolved}
+        onGenerateThreadPrompt={mockGenerateThreadPrompt}
+        onReplyToThread={mockReplyToThread}
+        onRemoveMessage={mockRemoveMessage}
+        onUpdateMessage={mockUpdateMessage}
+      />,
+      { wrapper },
+    );
+
+    expect(screen.getAllByText('Resolved').length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reopen thread' }));
+
+    expect(onSetResolved).toHaveBeenCalledWith('thread-1', false);
+    expect(mockRemoveThread).not.toHaveBeenCalled();
+  });
+
+  it('explains the closed input and offers no user actions once the review has finished', () => {
+    const onSetResolved = vi.fn();
+
+    render(
+      <CommentsListModal
+        isOpen={true}
+        onClose={vi.fn()}
+        onNavigate={vi.fn()}
+        comments={mockThreads}
+        onRemoveThread={mockRemoveThread}
+        onSetResolved={onSetResolved}
+        onGenerateThreadPrompt={mockGenerateThreadPrompt}
+        onReplyToThread={mockReplyToThread}
+        onRemoveMessage={mockRemoveMessage}
+        onUpdateMessage={mockUpdateMessage}
+        inputClosed
+        inputClosedReason="the review reached its time limit"
+      />,
+      { wrapper },
+    );
+
+    expect(
+      screen.getAllByText(/Review input closed: the review reached its time limit/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: 'Resolve thread' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Write a reply...')).not.toBeInTheDocument();
+    expect(screen.getByText('First root comment')).toBeInTheDocument();
+    expect(screen.getByText('First reply')).toBeInTheDocument();
   });
 });

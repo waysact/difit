@@ -36,9 +36,12 @@ interface DiffChunkProps {
   ) => Promise<void>;
   onGenerateThreadPrompt: (thread: CommentThread) => string;
   onRemoveThread: (threadId: string) => void;
+  onSetResolved?: (threadId: string, resolved: boolean) => void;
   onReplyToThread: (threadId: string, body: string) => Promise<void>;
   onRemoveMessage: (threadId: string, messageId: string) => void;
   onUpdateMessage: (threadId: string, messageId: string, newBody: string) => void;
+  commentsReadOnly?: boolean;
+  reviewInputClosedReason?: string | null;
   mode?: DiffViewMode;
   syntaxTheme?: AppearanceSettings['syntaxTheme'];
   cursor?: CursorPosition | null;
@@ -67,9 +70,12 @@ export const DiffChunk = memo(function DiffChunk({
   onAddComment,
   onGenerateThreadPrompt,
   onRemoveThread,
+  onSetResolved,
   onReplyToThread,
   onRemoveMessage,
   onUpdateMessage,
+  commentsReadOnly = false,
+  reviewInputClosedReason,
   mode = DEFAULT_DIFF_VIEW_MODE,
   syntaxTheme,
   cursor = null,
@@ -97,6 +103,10 @@ export const DiffChunk = memo(function DiffChunk({
   // Handle comment trigger from keyboard navigation
   useEffect(() => {
     if (commentTrigger?.lineIndex !== undefined) {
+      if (commentsReadOnly) {
+        onCommentTriggerHandled?.();
+        return;
+      }
       const line = chunk.lines[commentTrigger.lineIndex];
       if (line) {
         const lineNumber = line.newLineNumber || line.oldLineNumber;
@@ -107,17 +117,24 @@ export const DiffChunk = memo(function DiffChunk({
         }
       }
     }
-  }, [commentTrigger, chunk.lines, onCommentTriggerHandled]);
+  }, [commentTrigger, chunk.lines, commentsReadOnly, onCommentTriggerHandled]);
+
+  // A form already open when the review closes would otherwise keep a Submit that silently
+  // discards what the user typed.
+  useEffect(() => {
+    if (commentsReadOnly) setCommentingLine(null);
+  }, [commentsReadOnly]);
 
   const handleAddComment = useCallback(
     (side: DiffSide, lineNumber: LineNumber) => {
+      if (commentsReadOnly) return;
       if (commentingLine?.side === side && commentingLine?.lineNumber === lineNumber) {
         setCommentingLine(null);
       } else {
         setCommentingLine({ side, lineNumber });
       }
     },
-    [commentingLine],
+    [commentingLine, commentsReadOnly],
   );
 
   const getCommentLineFromAnchor = (selection: LineSelection): LineNumber => {
@@ -396,9 +413,12 @@ export const DiffChunk = memo(function DiffChunk({
         onAddComment={onAddComment}
         onGenerateThreadPrompt={onGenerateThreadPrompt}
         onRemoveThread={onRemoveThread}
+        onSetResolved={onSetResolved}
         onReplyToThread={onReplyToThread}
         onRemoveMessage={onRemoveMessage}
         onUpdateMessage={onUpdateMessage}
+        commentsReadOnly={commentsReadOnly}
+        reviewInputClosedReason={reviewInputClosedReason}
         onOpenInEditor={onOpenInEditor}
         syntaxTheme={syntaxTheme}
         cursor={cursor}
@@ -465,16 +485,20 @@ export const DiffChunk = memo(function DiffChunk({
                       }
                     }
                   }}
-                  onCommentButtonMouseDown={(e) => {
-                    e.stopPropagation();
-                    if (e.shiftKey) {
-                      e.preventDefault();
-                    }
-                    handleCommentButtonMouseDown({
-                      isShiftClick: e.shiftKey,
-                      selection,
-                    });
-                  }}
+                  onCommentButtonMouseDown={
+                    commentsReadOnly
+                      ? undefined
+                      : (e) => {
+                          e.stopPropagation();
+                          if (e.shiftKey) {
+                            e.preventDefault();
+                          }
+                          handleCommentButtonMouseDown({
+                            isShiftClick: e.shiftKey,
+                            selection,
+                          });
+                        }
+                  }
                   onOpenInEditor={
                     onOpenInEditor &&
                     filename &&
@@ -526,9 +550,12 @@ export const DiffChunk = memo(function DiffChunk({
                               showAuthorBadges={showAuthorBadges}
                               onGeneratePrompt={onGenerateThreadPrompt}
                               onRemoveThread={onRemoveThread}
+                              onSetResolved={onSetResolved}
                               onReplyToThread={onReplyToThread}
                               onRemoveMessage={onRemoveMessage}
                               onUpdateMessage={onUpdateMessage}
+                              inputClosed={commentsReadOnly}
+                              inputClosedReason={reviewInputClosedReason}
                               syntaxTheme={syntaxTheme}
                             />
                           </div>

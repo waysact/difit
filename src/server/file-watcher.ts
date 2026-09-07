@@ -61,6 +61,9 @@ export class FileWatcherService {
     watchPath: string,
     debounceMs = 300,
     onCacheInvalidate?: () => void,
+    // Defaults to console.log for callers (e.g. existing tests) that don't
+    // care about routing. The server passes its own `logHuman`.
+    log: (message: string) => void = console.log,
   ): Promise<void> {
     this.config = { watchPath, diffMode, debounceMs, onCacheInvalidate };
 
@@ -69,7 +72,7 @@ export class FileWatcherService {
 
     // No watching for specific commit comparisons
     if (diffMode === DiffMode.SPECIFIC) {
-      console.log('🔍 File watching disabled (specific commit comparison)');
+      log('🔍 File watching disabled (specific commit comparison)');
       return;
     }
 
@@ -219,20 +222,22 @@ export class FileWatcherService {
       this.debounceTimer = null;
     }
 
-    // Unsubscribe from all watchers
-    await Promise.all(
-      this.subscriptions.map(async (subscription) => {
-        try {
-          await subscription.unsubscribe();
-        } catch (error) {
-          console.warn('Error unsubscribing from file watcher:', error);
-        }
-      }),
+    // Unsubscribe every watcher before reporting failures, so one bad handle
+    // cannot leave the rest alive.
+    const results = await Promise.allSettled(
+      this.subscriptions.map((subscription) => subscription.unsubscribe()),
     );
     this.subscriptions = [];
 
     // Clear clients
     this.clients = [];
+
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result) => result.reason as unknown);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'Failed to stop file watchers');
+    }
   }
 
   addClient(res: Response): void {

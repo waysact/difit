@@ -1,14 +1,23 @@
 import { describe, it, expect } from 'vitest';
 
+import { DEFAULT_PREFERRED_PORT } from '../utils/ports.js';
+
 import {
   detectStdinSource,
+  reviewLifecycleOptions,
+  MAX_CLEANUP_GRACE_SECONDS,
   MAX_IDLE_GRACE_SECONDS,
   parseCommentOptions,
   shortHash,
   shouldReadStdin,
+  validateCleanupGraceSeconds,
   validateCommitish,
   validateDiffArguments,
   validateIdleGraceSeconds,
+  validateMaxPort,
+  validatePort,
+  validateTimeoutSeconds,
+  MAX_TIMEOUT_SECONDS,
 } from './utils';
 
 describe('CLI Utils', () => {
@@ -478,6 +487,193 @@ describe('CLI Utils', () => {
       expect(validateIdleGraceSeconds(MAX_IDLE_GRACE_SECONDS + 1)).toEqual({
         valid: false,
         error: `--idle-grace must be at most ${MAX_IDLE_GRACE_SECONDS} seconds`,
+      });
+    });
+  });
+
+  describe('validateTimeoutSeconds', () => {
+    it('accepts undefined, meaning --timeout was not given', () => {
+      expect(validateTimeoutSeconds(undefined)).toEqual({ valid: true });
+    });
+
+    it('accepts zero and other non-negative integers', () => {
+      expect(validateTimeoutSeconds(0)).toEqual({ valid: true });
+      expect(validateTimeoutSeconds(30)).toEqual({ valid: true });
+    });
+
+    it('rejects NaN, which is what a typo like "--timeout abc" parses to', () => {
+      expect(validateTimeoutSeconds(NaN)).toEqual({
+        valid: false,
+        error: '--timeout must be a non-negative integer',
+      });
+    });
+
+    it('rejects negative values', () => {
+      expect(validateTimeoutSeconds(-1)).toEqual({
+        valid: false,
+        error: '--timeout must be a non-negative integer',
+      });
+    });
+
+    it('rejects non-integer values', () => {
+      expect(validateTimeoutSeconds(1.5)).toEqual({
+        valid: false,
+        error: '--timeout must be a non-negative integer',
+      });
+    });
+
+    it("accepts the largest value whose millisecond form still fits setTimeout's 32-bit delay", () => {
+      expect(validateTimeoutSeconds(MAX_TIMEOUT_SECONDS)).toEqual({ valid: true });
+    });
+
+    it("rejects the smallest value whose millisecond form overflows setTimeout's 32-bit delay", () => {
+      expect(validateTimeoutSeconds(MAX_TIMEOUT_SECONDS + 1)).toEqual({
+        valid: false,
+        error: `--timeout must be at most ${MAX_TIMEOUT_SECONDS} seconds`,
+      });
+    });
+  });
+
+  describe('validateCleanupGraceSeconds', () => {
+    it('accepts an absent value and a non-negative integer', () => {
+      expect(validateCleanupGraceSeconds(undefined)).toEqual({ valid: true });
+      expect(validateCleanupGraceSeconds(0)).toEqual({ valid: true });
+      expect(validateCleanupGraceSeconds(600)).toEqual({ valid: true });
+      expect(validateCleanupGraceSeconds(MAX_CLEANUP_GRACE_SECONDS)).toEqual({ valid: true });
+    });
+
+    it('rejects values that would fire the timer almost immediately', () => {
+      // parseInt turns `--cleanup-grace abc` into NaN, and anything past the cap overflows
+      // setTimeout's 32-bit delay so Node clamps it to 1ms: both look like an instant expiry.
+      expect(validateCleanupGraceSeconds(Number.NaN).valid).toBe(false);
+      expect(validateCleanupGraceSeconds(-1).valid).toBe(false);
+      expect(validateCleanupGraceSeconds(1.5).valid).toBe(false);
+      expect(validateCleanupGraceSeconds(MAX_CLEANUP_GRACE_SECONDS + 1)).toEqual({
+        valid: false,
+        error: `--cleanup-grace must be at most ${MAX_CLEANUP_GRACE_SECONDS} seconds`,
+      });
+    });
+  });
+
+  describe('reviewLifecycleOptions', () => {
+    it('passes each duration flag through in milliseconds', () => {
+      expect(
+        reviewLifecycleOptions({
+          background: true,
+          idleGrace: 30,
+          timeout: 900,
+          cleanupGrace: 600,
+        }),
+      ).toEqual({
+        backgroundReview: true,
+        idleGraceMs: 30_000,
+        reviewTimeoutMs: 900_000,
+        cleanupGraceMs: 600_000,
+      });
+    });
+
+    it('omits an absent flag rather than passing undefined, so the server default applies', () => {
+      expect(reviewLifecycleOptions({ background: false })).toEqual({ backgroundReview: false });
+      expect(Object.keys(reviewLifecycleOptions({ background: true, timeout: 1 }))).toEqual([
+        'backgroundReview',
+        'reviewTimeoutMs',
+      ]);
+    });
+
+    it('keeps a zero grace, which is a real choice and not an absent flag', () => {
+      expect(reviewLifecycleOptions({ background: true, idleGrace: 0, cleanupGrace: 0 })).toEqual({
+        backgroundReview: true,
+        idleGraceMs: 0,
+        cleanupGraceMs: 0,
+      });
+    });
+  });
+
+  describe('validateMaxPort', () => {
+    it('accepts undefined, meaning --max-port was not given', () => {
+      expect(validateMaxPort(undefined, undefined)).toEqual({ valid: true });
+    });
+
+    it('accepts a ceiling at or above the starting port', () => {
+      expect(validateMaxPort(5100, 5000)).toEqual({ valid: true });
+      expect(validateMaxPort(5000, 5000)).toEqual({ valid: true });
+    });
+
+    it('rejects a ceiling below an explicit --port', () => {
+      expect(validateMaxPort(4900, 5000)).toEqual({
+        valid: false,
+        error: '--max-port (4900) must not be below --port (5000)',
+      });
+    });
+
+    it('rejects a ceiling below the default port when --port is omitted', () => {
+      expect(validateMaxPort(DEFAULT_PREFERRED_PORT - 1, undefined)).toEqual({
+        valid: false,
+        error: `--max-port (${DEFAULT_PREFERRED_PORT - 1}) must not be below --port (${DEFAULT_PREFERRED_PORT})`,
+      });
+    });
+
+    it('rejects NaN, which is what a typo like "--max-port abc" parses to', () => {
+      expect(validateMaxPort(NaN, undefined)).toEqual({
+        valid: false,
+        error: '--max-port must be an integer between 1 and 65535',
+      });
+    });
+
+    it('rejects ports outside the TCP range', () => {
+      expect(validateMaxPort(0, undefined)).toEqual({
+        valid: false,
+        error: '--max-port must be an integer between 1 and 65535',
+      });
+      expect(validateMaxPort(65536, undefined)).toEqual({
+        valid: false,
+        error: '--max-port must be an integer between 1 and 65535',
+      });
+    });
+
+    it('rejects a NaN preferredPort instead of letting it defeat the range check', () => {
+      // `--port abc --max-port 100` parses `--port` to NaN. `??` leaves NaN in
+      // place, and `100 < NaN` is always false, so the range check would
+      // silently pass a max-port that can never be reached from the port
+      // `startServer` actually binds first (DEFAULT_PREFERRED_PORT).
+      expect(validateMaxPort(100, NaN)).toEqual({
+        valid: false,
+        error: `--max-port (100) must not be below --port (${DEFAULT_PREFERRED_PORT})`,
+      });
+    });
+  });
+
+  describe('validatePort', () => {
+    it('accepts undefined, meaning --port was not given', () => {
+      expect(validatePort(undefined)).toEqual({ valid: true });
+    });
+
+    it('accepts a valid port', () => {
+      expect(validatePort(4000)).toEqual({ valid: true });
+    });
+
+    it('rejects NaN, which is what a typo like "--port abc" parses to', () => {
+      expect(validatePort(NaN)).toEqual({
+        valid: false,
+        error: '--port must be an integer between 1 and 65535',
+      });
+    });
+
+    it('rejects a non-integer port', () => {
+      expect(validatePort(80.5)).toEqual({
+        valid: false,
+        error: '--port must be an integer between 1 and 65535',
+      });
+    });
+
+    it('rejects ports outside the TCP range', () => {
+      expect(validatePort(0)).toEqual({
+        valid: false,
+        error: '--port must be an integer between 1 and 65535',
+      });
+      expect(validatePort(65536)).toEqual({
+        valid: false,
+        error: '--port must be an integer between 1 and 65535',
       });
     });
   });
