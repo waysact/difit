@@ -112,6 +112,7 @@ export interface DiffCommentMessage {
 // New data structures for enhanced comment and viewed state management
 export interface DiffCommentThread {
   id: string;
+  resolved?: boolean;
   filePath: string;
   createdAt: string; // ISO 8601 format
   updatedAt: string; // ISO 8601 format
@@ -136,6 +137,7 @@ interface CommentImportBase {
 
 export interface ThreadCommentImport extends CommentImportBase {
   type: 'thread';
+  resolved?: boolean;
 }
 
 export interface ReplyCommentImport extends CommentImportBase {
@@ -189,6 +191,7 @@ export interface DiffContextStorage {
 
 export interface CommentThread {
   id: string;
+  resolved?: boolean;
   file: string;
   line: LineNumber;
   side?: DiffSide;

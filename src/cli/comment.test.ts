@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import { createCommentCommand } from './comment.js';
+import { must } from '../test/must.js';
 
 describe('createCommentCommand', () => {
   const command = createCommentCommand();
@@ -17,7 +18,10 @@ describe('createCommentCommand', () => {
   });
 
   describe('add subcommand', () => {
-    const addCommand = command.commands.find((c) => c.name() === 'add')!;
+    const addCommand = must(
+      command.commands.find((c) => c.name() === 'add'),
+      'the add subcommand is registered',
+    );
 
     it('requires --port option', () => {
       const portOption = addCommand.options.find((o) => o.long === '--port');
@@ -34,7 +38,10 @@ describe('createCommentCommand', () => {
   });
 
   describe('get subcommand', () => {
-    const getCommand = command.commands.find((c) => c.name() === 'get')!;
+    const getCommand = must(
+      command.commands.find((c) => c.name() === 'get'),
+      'the get subcommand is registered',
+    );
 
     it('requires --port option', () => {
       const portOption = getCommand.options.find((o) => o.long === '--port');
@@ -51,7 +58,10 @@ describe('createCommentCommand', () => {
   });
 
   describe('resolve subcommand', () => {
-    const resolveCommand = command.commands.find((c) => c.name() === 'resolve')!;
+    const resolveCommand = must(
+      command.commands.find((c) => c.name() === 'resolve'),
+      'the resolve subcommand is registered',
+    );
 
     it('has "remove" alias', () => {
       expect(resolveCommand.aliases()).toContain('remove');
@@ -118,7 +128,50 @@ describe('comment subcommand integration', () => {
   });
 
   describe('add', () => {
+    it('pins bootstrap identity, version and selection when importing selected comments', async () => {
+      mockFetch
+        .mockResolvedValueOnce(
+          jsonResponse({
+            sessionId: 'process-A',
+            version: 7,
+            review: { sessionId: 'process-A' },
+            selection: { baseCommitish: 'base', targetCommitish: 'target', baseMode: 'merge-base' },
+            threads: [],
+          }),
+        )
+        .mockResolvedValueOnce(jsonResponse({ success: true, count: 1 }));
+      await createCommentCommand().parseAsync([
+        'node',
+        'difit',
+        'add',
+        '--port',
+        '4966',
+        '{"type":"thread","filePath":"test.ts","position":{"side":"new","line":1},"body":"Test"}',
+      ]);
+      expect(mockFetch).toHaveBeenNthCalledWith(1, 'http://localhost:4966/api/comments-json');
+      const [url, request] = must(mockFetch.mock.calls[1], 'the import follows the bootstrap read');
+      expect(url).toBe(
+        'http://localhost:4966/api/comment-imports?base=base&target=target&baseMode=merge-base',
+      );
+      expect(request?.headers).toEqual({
+        'Content-Type': 'application/json',
+        'X-Difit-Session': 'process-A',
+      });
+      expect(JSON.parse(request?.body as string)).toMatchObject({
+        baseVersion: 7,
+        imports: [{ body: 'Test' }],
+      });
+    });
     it('sends comment imports to the server', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       mockFetch.mockResolvedValue(jsonResponse({ success: true, importId: 'abc123', count: 1 }));
 
       const command = createCommentCommand();
@@ -132,7 +185,7 @@ describe('comment subcommand integration', () => {
       ]);
 
       expect(mockFetch).toHaveBeenCalledWith(
-        'http://localhost:4966/api/comment-imports',
+        'http://localhost:4966/api/comment-imports?base=other-base&target=other-target&baseMode=direct',
         expect.objectContaining({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -142,6 +195,15 @@ describe('comment subcommand integration', () => {
     });
 
     it('validates JSON before sending', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       const command = createCommentCommand();
       await command.parseAsync(['node', 'difit', 'add', '--port', '4966', 'not-valid-json']);
 
@@ -150,7 +212,42 @@ describe('comment subcommand integration', () => {
       expect(process.exit).toHaveBeenCalledWith(1);
     });
 
+    it('reports the status when the error response is not JSON', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
+      mockFetch.mockResolvedValue(textResponse('<html>502 Bad Gateway</html>', 502));
+
+      const command = createCommentCommand();
+      await command.parseAsync([
+        'node',
+        'difit',
+        'add',
+        '--port',
+        '4966',
+        '{"type":"thread","filePath":"test.ts","position":{"side":"new","line":1},"body":"Test"}',
+      ]);
+
+      expect(consoleErrors[0]).toContain('Comment request failed (502)');
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
     it('handles server error response', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       mockFetch.mockResolvedValue(jsonResponse({ error: 'Bad request' }, 400));
 
       const command = createCommentCommand();
@@ -168,6 +265,15 @@ describe('comment subcommand integration', () => {
     });
 
     it('handles connection error', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       const fetchError = new TypeError('fetch failed');
       mockFetch.mockRejectedValue(fetchError);
 
@@ -229,18 +335,86 @@ describe('comment subcommand integration', () => {
   });
 
   describe('resolve', () => {
+    it('chains selected DELETE versions and reports conflicts without retry or retargeting remaining IDs', async () => {
+      mockFetch
+        .mockResolvedValueOnce(
+          jsonResponse({
+            sessionId: 'process-A',
+            version: 7,
+            review: { sessionId: 'process-A' },
+            selection: { baseCommitish: 'base', targetCommitish: 'target' },
+            threads: [],
+          }),
+        )
+        .mockResolvedValueOnce(jsonResponse({ success: true, version: 8 }))
+        .mockResolvedValueOnce(
+          jsonResponse(
+            {
+              error: { code: 'version_conflict', message: 'Comment version has changed' },
+              version: 9,
+              sessionId: 'process-A',
+            },
+            409,
+          ),
+        );
+      await createCommentCommand().parseAsync([
+        'node',
+        'difit',
+        'remove',
+        '--port',
+        '4966',
+        'one',
+        'two',
+        'three',
+      ]);
+      expect(mockFetch).toHaveBeenNthCalledWith(
+        2,
+        'http://localhost:4966/api/comments/one?base=base&target=target&baseMode=direct&expectedVersion=7',
+        { method: 'DELETE', headers: { 'X-Difit-Session': 'process-A' } },
+      );
+      expect(mockFetch).toHaveBeenNthCalledWith(
+        3,
+        'http://localhost:4966/api/comments/two?base=base&target=target&baseMode=direct&expectedVersion=8',
+        { method: 'DELETE', headers: { 'X-Difit-Session': 'process-A' } },
+      );
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      const printed = must(consoleOutput[0], 'the resolve command printed its JSON result');
+      expect(JSON.parse(printed)).toMatchObject({
+        success: false,
+        resolved: ['one'],
+        errors: [
+          { threadId: 'two', error: expect.stringContaining('version_conflict') },
+          { threadId: 'three', error: expect.stringContaining('version_conflict') },
+        ],
+      });
+    });
     it('sends DELETE requests for each thread ID', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       mockFetch.mockResolvedValue(jsonResponse({ success: true, threadId: 'abc123', version: 2 }));
 
       const command = createCommentCommand();
       await command.parseAsync(['node', 'difit', 'resolve', '--port', '4966', 'abc123', 'def456']);
 
-      expect(mockFetch).toHaveBeenCalledWith('http://localhost:4966/api/comments/abc123', {
-        method: 'DELETE',
-      });
-      expect(mockFetch).toHaveBeenCalledWith('http://localhost:4966/api/comments/def456', {
-        method: 'DELETE',
-      });
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:4966/api/comments/abc123?base=other-base&target=other-target&baseMode=direct',
+        {
+          method: 'DELETE',
+        },
+      );
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:4966/api/comments/def456?base=other-base&target=other-target&baseMode=direct',
+        {
+          method: 'DELETE',
+        },
+      );
       expect(consoleOutput[0]).toBe(
         JSON.stringify({
           success: true,
@@ -253,29 +427,62 @@ describe('comment subcommand integration', () => {
     });
 
     it('works via the remove alias', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       mockFetch.mockResolvedValue(jsonResponse({ success: true, threadId: 'abc123', version: 2 }));
 
       const command = createCommentCommand();
       await command.parseAsync(['node', 'difit', 'remove', '--port', '4966', 'abc123']);
 
-      expect(mockFetch).toHaveBeenCalledWith('http://localhost:4966/api/comments/abc123', {
-        method: 'DELETE',
-      });
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:4966/api/comments/abc123?base=other-base&target=other-target&baseMode=direct',
+        {
+          method: 'DELETE',
+        },
+      );
       expect(consoleOutput[0]).toContain('"success":true');
     });
 
     it('URL-encodes thread IDs', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       mockFetch.mockResolvedValue(jsonResponse({ success: true }));
 
       const command = createCommentCommand();
       await command.parseAsync(['node', 'difit', 'resolve', '--port', '4966', 'a/b c']);
 
-      expect(mockFetch).toHaveBeenCalledWith('http://localhost:4966/api/comments/a%2Fb%20c', {
-        method: 'DELETE',
-      });
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:4966/api/comments/a%2Fb%20c?base=other-base&target=other-target&baseMode=direct',
+        {
+          method: 'DELETE',
+        },
+      );
     });
 
     it('reports unknown thread IDs and exits with an error', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       mockFetch
         .mockResolvedValueOnce(jsonResponse({ success: true, threadId: 'abc123', version: 2 }))
         .mockResolvedValueOnce(jsonResponse({ error: 'Thread not found: missing' }, 404));
@@ -294,7 +501,44 @@ describe('comment subcommand integration', () => {
       expect(process.exit).toHaveBeenCalledWith(1);
     });
 
+    it('keeps resolving the remaining thread IDs when one error response is not JSON', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
+      mockFetch
+        .mockResolvedValueOnce(textResponse('<html>502 Bad Gateway</html>', 502))
+        .mockResolvedValueOnce(jsonResponse({ success: true, threadId: 'def456', version: 2 }));
+
+      const command = createCommentCommand();
+      await command.parseAsync(['node', 'difit', 'resolve', '--port', '4966', 'abc123', 'def456']);
+
+      expect(consoleOutput[0]).toBe(
+        JSON.stringify({
+          success: false,
+          resolved: ['def456'],
+          notFound: [],
+          errors: [{ threadId: 'abc123', error: 'Comment request failed (502)' }],
+        }),
+      );
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
     it('collects server errors without dropping remaining thread IDs', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       mockFetch
         .mockResolvedValueOnce(jsonResponse({ error: 'Internal error' }, 500))
         .mockResolvedValueOnce(jsonResponse({ success: true, threadId: 'def456', version: 2 }));
@@ -314,6 +558,15 @@ describe('comment subcommand integration', () => {
     });
 
     it('handles connection error', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          sessionId: 'process-A',
+          version: 0,
+          review: null,
+          selection: { baseCommitish: 'other-base', targetCommitish: 'other-target' },
+          threads: [],
+        }),
+      );
       mockFetch.mockRejectedValue(new TypeError('fetch failed'));
 
       const command = createCommentCommand();

@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
+import { must } from '../../test/must.js';
 import type { CommentThread } from '../../types/diff';
 
 import { CommentThreadCard } from './CommentThreadCard';
@@ -33,6 +34,31 @@ const mockThread: CommentThread = {
 };
 
 describe('CommentThreadCard', () => {
+  it('renders a resolved thread and reopens it without deleting its messages', async () => {
+    const user = userEvent.setup();
+    const onSetResolved = vi.fn();
+
+    render(
+      <CommentThreadCard
+        thread={{ ...mockThread, resolved: true }}
+        confirmRootAction={false}
+        onGeneratePrompt={() => 'thread prompt'}
+        onRemoveThread={vi.fn()}
+        onSetResolved={onSetResolved}
+        onReplyToThread={vi.fn().mockResolvedValue(undefined)}
+        onRemoveMessage={vi.fn()}
+        onUpdateMessage={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Resolved')).toBeInTheDocument();
+    expect(screen.getByText('Reply comment')).toBeInTheDocument();
+
+    await user.click(screen.getByTitle('Reopen thread'));
+
+    expect(onSetResolved).toHaveBeenCalledWith('thread-1', false);
+  });
+
   it('does not show delete action for replies authored by someone else', () => {
     render(
       <CommentThreadCard
@@ -416,5 +442,41 @@ describe('CommentThreadCard', () => {
     await user.click(screen.getByRole('button', { name: 'Delete' }));
 
     expect(onRemoveMessage).toHaveBeenCalledWith('thread-1', 'message-2');
+  });
+
+  it('closes an open editor when the review stops accepting input', async () => {
+    const user = userEvent.setup();
+    const onUpdateMessage = vi.fn();
+    const props = {
+      thread: mockThread,
+      onGeneratePrompt: () => '',
+      onRemoveThread: vi.fn(),
+      onReplyToThread: vi.fn().mockResolvedValue(undefined),
+      onRemoveMessage: vi.fn(),
+      onUpdateMessage,
+    };
+
+    const { rerender } = render(<CommentThreadCard {...props} />);
+
+    await user.click(
+      must(
+        screen.getAllByTitle('Edit message')[0],
+        'getAllByTitle throws unless at least one edit control matched',
+      ),
+    );
+    expect(screen.getByRole('textbox')).toBeInTheDocument();
+
+    rerender(
+      <CommentThreadCard
+        {...props}
+        inputClosed
+        inputClosedReason="the review reached its time limit"
+      />,
+    );
+
+    // Leaving the editor up would offer a Save whose handler can no longer do anything.
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.getByText(/Review input closed/)).toBeInTheDocument();
+    expect(onUpdateMessage).not.toHaveBeenCalled();
   });
 });

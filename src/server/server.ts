@@ -1,10 +1,12 @@
 import { spawn } from 'child_process';
 import { createHash } from 'crypto';
+import { randomUUID } from 'node:crypto';
 import { type Server } from 'http';
+import { type Socket } from 'node:net';
 import { join, dirname, isAbsolute, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 
-import express, { type Express } from 'express';
+import express, { type Express, type Request, type Response } from 'express';
 import open from 'open';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -25,11 +27,19 @@ import {
   resolveEnvEditor,
 } from '../utils/editorOptions.js';
 import { getFileExtension } from '../utils/fileUtils.js';
+import { effectivePreferredPort } from '../utils/ports.js';
+import { resolvePublicUrl } from '../utils/public-url.js';
+import { listenerApiUrl } from '../utils/listener-url.js';
 
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
 import { isLoopbackAddress } from './loopback.js';
 import { ReviewLifecycle } from './review-lifecycle.js';
+import { createReviewRouter } from './review-api.js';
+import { requireReviewIdentity, reviewBodyParser, reviewErrors } from './review-http.js';
+import { createReviewStore } from './review-store.js';
+import type { ReviewSnapshot } from '../types/review.js';
+import { runBoundedShutdown } from './shutdown.js';
 import { parseUserSettingsPatch, readUserConfig, updateUserClientSettings } from './user-config.js';
 
 import {
@@ -47,9 +57,10 @@ import {
   createDiffSelection,
   diffSelectionsEqual,
   getDiffSelectionKey,
+  normalizeBaseMode,
 } from '../utils/diffSelection.js';
 
-interface ServerOptions {
+export interface ServerOptions {
   selection?: DiffSelection;
   stdinDiff?: string;
   preferredPort?: number;
@@ -59,11 +70,29 @@ interface ServerOptions {
   clearComments?: boolean;
   commentImports?: CommentImport[];
   keepAlive?: boolean;
+  /** A detached review completes first, then exits after its cleanup grace. */
+  backgroundReview?: boolean;
+  /** Maximum lifetime of the review after its listener is ready. */
+  reviewTimeoutMs?: number;
+  /** Maximum final-processing window for a completed background review. */
+  cleanupGraceMs?: number;
   /** Milliseconds with zero heartbeat clients before the review counts as idle. */
   idleGraceMs?: number;
   diffMode?: DiffMode;
   repoPath?: string;
   contextLines?: number;
+  /** Highest port the fallback search may try. Defaults to preferredPort + 99. */
+  maxPort?: number;
+  /** When true, fail immediately instead of trying the next port. */
+  strictPort?: boolean;
+  /** URL reported to consumers instead of the bound one; `{port}` is substituted. */
+  publicUrl?: string;
+  /**
+   * How long the claimed idle shutdown may spend on cleanup before the exit is
+   * forced. Defaults to `SHUTDOWN_WATCHDOG_MS`; set only so a test does not
+   * have to wait the real bound out.
+   */
+  shutdownTimeoutMs?: number;
 }
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
@@ -126,9 +155,77 @@ function createCommentSessionKey(selection: DiffSelection): string {
   return getDiffSelectionKey(selection);
 }
 
-export async function startServer(
-  options: ServerOptions,
-): Promise<{ port: number; url: string; isEmpty?: boolean; server?: Server }> {
+/** Selected legacy defaults apply only to absent fields; malformed supplied values must not erase state. */
+function validateSelectedCommentPayload(payload: Record<string, unknown>): void {
+  function invalid(field: string): never {
+    throw Object.assign(new Error(`Invalid comment field: ${field}`), { code: 'invalid_request' });
+  }
+  const record = (value: unknown): Record<string, unknown> => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) invalid('entry');
+    return value as Record<string, unknown>;
+  };
+  const stringField = (entry: Record<string, unknown>, field: string, nonempty = false): void => {
+    if (!(field in entry)) return;
+    const value = entry[field];
+    if (typeof value !== 'string' || (nonempty && value.trim().length === 0)) invalid(field);
+  };
+  const positiveLine = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+  const legacy = (entry: Record<string, unknown>, kind: 'comment' | 'thread' | 'message'): void => {
+    stringField(entry, 'id', true);
+    for (const field of kind === 'comment' ? ['timestamp'] : ['createdAt', 'updatedAt'])
+      stringField(entry, field, true);
+    if (kind !== 'thread') {
+      stringField(entry, 'body');
+      stringField(entry, 'author');
+    }
+    if (kind === 'message') return;
+    stringField(entry, 'file', true);
+    stringField(entry, 'codeContent');
+    if ('side' in entry && entry.side !== 'old' && entry.side !== 'new') invalid('side');
+    if ('line' in entry && !positiveLine(entry.line)) {
+      const line = entry.line;
+      if (
+        !Array.isArray(line) ||
+        line.length !== 2 ||
+        !positiveLine(line[0]) ||
+        !positiveLine(line[1]) ||
+        line[0] > line[1]
+      )
+        invalid('line');
+    }
+    if (kind === 'thread') {
+      if ('resolved' in entry && typeof entry.resolved !== 'boolean') invalid('resolved');
+      if ('messages' in entry) {
+        if (!Array.isArray(entry.messages)) invalid('messages');
+        for (const message of entry.messages) legacy(record(message), 'message');
+      }
+    }
+  };
+  for (const field of ['threads', 'comments']) {
+    if (field in payload && !Array.isArray(payload[field])) invalid(field);
+  }
+  const threads = Array.isArray(payload.threads);
+  const entries = (threads ? payload.threads : payload.comments) as unknown[];
+  for (const value of entries) {
+    const entry = record(value);
+    if (threads && ('filePath' in entry || 'position' in entry || 'codeSnapshot' in entry)) {
+      if (!('filePath' in entry) || !('position' in entry)) invalid('canonical thread');
+      continue;
+    }
+    legacy(entry, threads ? 'thread' : 'comment');
+  }
+}
+
+export async function startServer(options: ServerOptions): Promise<{
+  port: number;
+  url: string;
+  isEmpty?: boolean;
+  server: Server;
+  getReviewSnapshot: () => ReviewSnapshot;
+  /** Starts the server-owned bounded teardown coordinator. */
+  startShutdown: (response?: Response) => void;
+}> {
   const app = express();
   // Set once `listen` succeeds, below, from the OS-resolved bind address
   // (`server.address()`) rather than the raw `--host` string: `net.isIP`
@@ -162,9 +259,6 @@ export async function startServer(
 
     return undefined;
   };
-
-  app.use(express.json());
-  app.use(express.text()); // For sendBeacon text/plain requests
 
   app.use((_req, res, next) => {
     res.header('Access-Control-Allow-Origin', 'http://localhost:*');
@@ -214,6 +308,16 @@ export async function startServer(
     Boolean(options.stdinDiff),
   );
 
+  // The snapshot reports the revision pair difit was launched with. Reading
+  // `currentCommentSelection` instead would let a human switching revisions in the
+  // browser silently redirect what the waiting agent receives.
+  const launchCommentSelection = currentCommentSelection;
+  const launchSelectionKey = createCommentSessionKey(launchCommentSelection);
+
+  // Assigned once the listener binds, further down; declared here because the routes defined
+  // above that point close over it.
+  let publicUrl = '';
+
   function parseRepositoryRelativePath(filepath: unknown):
     | { ok: true; path: string }
     | {
@@ -261,16 +365,285 @@ export async function startServer(
   }
 
   const idleGraceMs = options.idleGraceMs ?? 10_000;
+  const backgroundReview = options.backgroundReview ?? false;
+  const reviewTimeoutMs = options.reviewTimeoutMs ?? 3_600_000;
+  const cleanupGraceMs = options.cleanupGraceMs ?? 300_000;
+
+  const logHuman = (message: string): void => {
+    console.log(message);
+  };
+
   const lifecycle = new ReviewLifecycle(idleGraceMs);
   let idleTimer: NodeJS.Timeout | null = null;
+  let reviewTimeoutTimer: NodeJS.Timeout | null = null;
+  let cleanupTimer: NodeJS.Timeout | null = null;
+  let shutdownClaimed = false;
+  let server: Server | undefined;
+  const sockets = new Set<Socket>();
+  const heartbeatResponses = new Set<Response>();
+  const watchResponses = new Set<Response>();
+
+  /**
+   * Claims the single shutdown this server instance is allowed to perform. The idle path, the
+   * review deadline, an explicit HTTP stop and the signal handlers are independent and
+   * asynchronous; whichever claims first proceeds, and every later caller gets `false` back and
+   * must not exit.
+   */
+  function claimShutdown(): boolean {
+    if (shutdownClaimed) {
+      return false;
+    }
+    shutdownClaimed = true;
+    return true;
+  }
 
   const commentSessions = new Map<string, CommentSessionState>();
   const initialCommentThreads = mergeCommentImports([], initialCommentImports).threads;
-  if (initialCommentThreads.length > 0) {
-    commentSessions.set(createCommentSessionKey(currentCommentSelection), {
-      threads: initialCommentThreads,
-      version: 1,
+  const reviewStore = createReviewStore({
+    sessionId: randomUUID(),
+    selectionKey: launchSelectionKey,
+    initialThreads: initialCommentThreads,
+    selection: {
+      requestedBase: initialSelection.baseCommitish,
+      requestedTarget: initialSelection.targetCommitish,
+      resolvedBase: launchCommentSelection.baseCommitish,
+      resolvedTarget: launchCommentSelection.targetCommitish,
+      baseMode: normalizeBaseMode(launchCommentSelection.baseMode),
+    },
+    limits: { idleGraceMs, timeoutMs: reviewTimeoutMs, cleanupGraceMs },
+    now: () => new Date(),
+    autoCleanup: backgroundReview,
+  });
+  let broadcastVersion = reviewStore.snapshot().version;
+  let broadcastCursor = reviewStore.snapshot().cursor;
+  // Completion advances the journal cursor without changing the comment collection, so review
+  // notifications follow the cursor while comment notifications follow the version. Gating both
+  // on the version would silently drop the `review.finished` notification the SPA needs to close
+  // its input.
+  const unsubscribeBroadcast = reviewStore.subscribe(() => {
+    const { version, cursor, session } = reviewStore.snapshot();
+    const timestamp = new Date().toISOString();
+    if (version !== broadcastVersion) {
+      broadcastVersion = version;
+      fileWatcher.broadcast({
+        type: 'commentsChanged',
+        version,
+        timestamp,
+      });
+    }
+    if (cursor !== broadcastCursor) {
+      broadcastCursor = cursor;
+      fileWatcher.broadcast({
+        type: 'reviewChanged',
+        sessionId: session.sessionId,
+        cursor,
+        timestamp,
+      });
+    }
+  });
+
+  /** Arm exactly one background cleanup from the completion timestamp the store published. */
+  const scheduleBackgroundCleanup = (): void => {
+    const { session } = reviewStore.snapshot();
+    if (!backgroundReview || session.state !== 'finished' || cleanupTimer || !session.cleanupAt) {
+      return;
+    }
+    if (reviewTimeoutTimer) {
+      clearTimeout(reviewTimeoutTimer);
+      reviewTimeoutTimer = null;
+    }
+    const remainingMs = Math.max(0, new Date(session.cleanupAt).getTime() - Date.now());
+    cleanupTimer = setTimeout(() => startShutdown(), remainingMs).unref();
+  };
+  const unsubscribeCleanupScheduler = reviewStore.subscribe(scheduleBackgroundCleanup);
+
+  const clearLifecycleTimers = (): void => {
+    for (const timer of [idleTimer, reviewTimeoutTimer, cleanupTimer]) {
+      if (timer) clearTimeout(timer);
+    }
+    idleTimer = null;
+    reviewTimeoutTimer = null;
+    cleanupTimer = null;
+  };
+
+  const waitForResponse = (response: Response): Promise<void> =>
+    new Promise((resolveResponse) => {
+      const done = (): void => {
+        response.off('finish', done);
+        response.off('close', done);
+        resolveResponse();
+      };
+      response.once('finish', done);
+      response.once('close', done);
     });
+
+  const closeListener = async (): Promise<void> => {
+    const listener = server;
+    if (!listener || !listener.listening) return;
+    await new Promise<void>((resolveClose, rejectClose) => {
+      listener.close((error) => (error ? rejectClose(error) : resolveClose()));
+      for (const socket of sockets) socket.destroy();
+    });
+  };
+
+  const removeSignalHandlers = (): void => {
+    process.off('SIGINT', handleSigint);
+    process.off('SIGTERM', handleSigterm);
+  };
+
+  /** Runs every process-ending path through the one synchronous shutdown claim. */
+  const startShutdownWithExitCode = (response: Response | undefined, exitCode: number): void => {
+    if (!claimShutdown()) return;
+    clearLifecycleTimers();
+    const responseFinished = response ? waitForResponse(response) : Promise.resolve();
+    reviewStore.beginStop();
+    void runBoundedShutdown({
+      exitCode,
+      failureExitCode: exitCode === 0 ? 1 : exitCode,
+      exit: (code) => process.exit(code),
+      reportError: (error) => console.error('Failed to shut down difit server:', error),
+      ...(options.shutdownTimeoutMs === undefined ? {} : { timeoutMs: options.shutdownTimeoutMs }),
+      run: async () => {
+        await responseFinished;
+        for (const sseResponse of heartbeatResponses) sseResponse.end();
+        for (const sseResponse of watchResponses) sseResponse.end();
+        await closeListener();
+        // The person's comments are the point of the run. Print them before any teardown step that
+        // can fail, so a watcher unsubscribe error cannot swallow them on the way out.
+        outputFinalComments();
+        try {
+          await fileWatcher.stop();
+        } finally {
+          clearLifecycleTimers();
+          unsubscribeBroadcast();
+          unsubscribeCleanupScheduler();
+          removeSignalHandlers();
+        }
+      },
+    }).catch(() => {
+      process.exitCode = exitCode === 0 ? 1 : exitCode;
+    });
+  };
+
+  /** Starts bounded teardown after an optional HTTP response has settled. */
+  function startShutdown(response?: Response): void {
+    startShutdownWithExitCode(response, 0);
+  }
+
+  function handleSigint(): void {
+    startShutdownWithExitCode(undefined, 130);
+  }
+
+  function handleSigterm(): void {
+    startShutdownWithExitCode(undefined, 143);
+  }
+
+  app.use(
+    '/api',
+    createReviewRouter({
+      store: reviewStore,
+      shutdown: startShutdown,
+    }),
+  );
+
+  const selectedComments = express.Router();
+  const mutationSelections = new WeakMap<Request, DiffSelection>();
+  selectedComments.use((req, res, next) => {
+    const mutation =
+      (req.method === 'POST' && /^\/(comments|comment-imports)\/?$/i.test(req.path)) ||
+      (req.method === 'DELETE' && /^\/comments\/[^/]+\/?$/i.test(req.path));
+    if (!mutation) {
+      next('router');
+      return;
+    }
+    const selection = getCommentSelectionFromQuery(req.query);
+    mutationSelections.set(req, selection);
+    if (createCommentSessionKey(selection) !== launchSelectionKey) {
+      next('router');
+      return;
+    }
+    res.set('Cache-Control', 'no-store');
+    requireReviewIdentity(req, reviewStore);
+    next();
+  });
+  selectedComments.use(reviewBodyParser());
+  selectedComments.use(reviewBodyParser(express.text()));
+  selectedComments.post('/comments', (req, res) => {
+    const body = selectedBody(req.body);
+    const current = reviewStore.checkUserVersion(body.baseVersion);
+    if (!Array.isArray(body.threads) && !Array.isArray(body.comments)) {
+      throw Object.assign(new Error('Expected a threads array'), { code: 'invalid_request' });
+    }
+    validateSelectedCommentPayload(body);
+    const snapshot = reviewStore.replaceUserThreads(parseCommentsPayload(body), current.version);
+    res.json({
+      success: true,
+      merged: false,
+      version: snapshot.version,
+      threads: snapshot.threads,
+    });
+  });
+  selectedComments.post('/comment-imports', (req, res) => {
+    const body = selectedBody(req.body);
+    const current = reviewStore.checkUserVersion(body.baseVersion);
+    let imports: CommentImport[];
+    try {
+      if (!Array.isArray(body.imports)) throw new Error('Expected an imports array');
+      imports = normalizeCommentImports(body.imports);
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      throw Object.assign(error, { code: 'invalid_request' });
+    }
+    const merged = mergeCommentImports(current.threads, imports);
+    const snapshot = reviewStore.replaceUserThreads(merged.threads, current.version);
+    res.json({
+      success: true,
+      changed: snapshot.version !== current.version,
+      version: snapshot.version,
+      count: imports.length,
+      importId: createHash('sha256').update(serializeCommentImports(imports)).digest('hex'),
+      warnings: merged.warnings,
+    });
+  });
+  selectedComments.delete('/comments/:threadId', (req, res) => {
+    const raw = req.query.expectedVersion;
+    if (raw !== undefined && (typeof raw !== 'string' || !/^\d+$/.test(raw))) {
+      throw Object.assign(new Error('Expected a safe nonnegative integer version'), {
+        code: 'invalid_request',
+      });
+    }
+    const current = reviewStore.checkUserVersion(raw === undefined ? undefined : Number(raw));
+    const threads = current.threads.filter((thread) => thread.id !== req.params.threadId);
+    if (threads.length === current.threads.length)
+      throw Object.assign(new Error('Review thread does not exist'), { code: 'thread_not_found' });
+    const snapshot = reviewStore.replaceUserThreads(threads, current.version);
+    res.json({ success: true, threadId: req.params.threadId, version: snapshot.version });
+  });
+  selectedComments.use(reviewErrors(reviewStore, () => true));
+  app.use('/api', selectedComments);
+  app.use(express.json());
+  app.use(express.text());
+
+  /** Parsing can yield while another request changes the browser's current selection. */
+  function mutationSelection(req: Request): DiffSelection {
+    const selection = mutationSelections.get(req);
+    if (!selection) throw new Error('Comment mutation selection was not captured');
+    return selection;
+  }
+
+  function selectedBody(input: unknown): Record<string, unknown> {
+    let body = input;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        throw Object.assign(new Error('Malformed JSON request'), { code: 'invalid_request' });
+      }
+    }
+    if (typeof body !== 'object' || body === null || Array.isArray(body))
+      throw Object.assign(new Error('Expected a JSON object'), { code: 'invalid_request' });
+    return body as Record<string, unknown>;
   }
 
   function getCommentSelectionFromQuery(query: Record<string, unknown>): DiffSelection {
@@ -279,7 +652,9 @@ export async function startServer(
     const hasBaseMode = typeof query.baseMode === 'string';
 
     if (!hasBase && !hasTarget && !hasBaseMode) {
-      return currentCommentSelection;
+      // No selection means the caller is the CLI, which cannot know what the browser is looking at.
+      // Pin it to the review difit was launched for, not to the pair a tab loaded last.
+      return launchCommentSelection;
     }
 
     return createDiffSelection(
@@ -295,6 +670,7 @@ export async function startServer(
 
   function getOrCreateCommentSession(selection: DiffSelection): CommentSessionState {
     const key = createCommentSessionKey(selection);
+    if (key === launchSelectionKey) return reviewStore.snapshot();
     const existing = commentSessions.get(key);
     if (existing) {
       return existing;
@@ -584,6 +960,8 @@ export async function startServer(
   }
 
   function normalizeComment(comment: Comment): DiffCommentThread {
+    if (typeof comment !== 'object' || comment === null)
+      throw Object.assign(new Error('Expected a comment object'), { code: 'invalid_request' });
     const now = new Date().toISOString();
     const timestamp = typeof comment.timestamp === 'string' ? comment.timestamp : now;
     const threadId =
@@ -623,6 +1001,7 @@ export async function startServer(
   function toCommentThread(thread: DiffCommentThread): CommentThread {
     return {
       id: thread.id,
+      resolved: thread.resolved ?? false,
       file: thread.filePath,
       line:
         typeof thread.position.line === 'number'
@@ -637,9 +1016,20 @@ export async function startServer(
   }
 
   function normalizeThreadPayload(thread: CommentThread | DiffCommentThread): DiffCommentThread {
+    if (typeof thread !== 'object' || thread === null)
+      throw Object.assign(new Error('Expected a comment thread object'), {
+        code: 'invalid_request',
+      });
     if ('filePath' in thread && 'position' in thread) {
       return thread;
     }
+    if (
+      Array.isArray(thread.messages) &&
+      thread.messages.some((message) => typeof message !== 'object' || message === null)
+    )
+      throw Object.assign(new Error('Expected comment message objects'), {
+        code: 'invalid_request',
+      });
 
     const threadId =
       typeof thread.id === 'string' && thread.id.length > 0
@@ -671,6 +1061,7 @@ export async function startServer(
 
     return {
       id: threadId,
+      resolved: thread.resolved ?? false,
       filePath:
         typeof thread.file === 'string' && thread.file.length > 0 ? thread.file : '<unknown file>',
       createdAt: thread.createdAt || firstMessage?.createdAt || now,
@@ -731,6 +1122,8 @@ export async function startServer(
     selection: DiffSelection,
     nextThreads: DiffCommentThread[],
   ): boolean {
+    if (createCommentSessionKey(selection) === launchSelectionKey)
+      throw new Error('Selected review mutations must use the review store');
     const session = getOrCreateCommentSession(selection);
     const previous = JSON.stringify(session.threads);
     const next = JSON.stringify(nextThreads);
@@ -751,7 +1144,7 @@ export async function startServer(
 
   app.post('/api/comments', (req, res) => {
     try {
-      const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
+      const selection = mutationSelection(req);
       const body: unknown =
         typeof req.body === 'string' ? (JSON.parse(req.body) as unknown) : req.body;
       const nextThreads = parseCommentsPayload(body);
@@ -781,7 +1174,7 @@ export async function startServer(
 
   app.post('/api/comment-imports', (req, res) => {
     try {
-      const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
+      const selection = mutationSelection(req);
       const session = getOrCreateCommentSession(selection);
       const commentImports = parseCommentImportsPayload(req.body);
       const importId = createHash('sha256')
@@ -804,7 +1197,7 @@ export async function startServer(
   });
 
   app.delete('/api/comments/:threadId', (req, res) => {
-    const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
+    const selection = mutationSelection(req);
     const session = getOrCreateCommentSession(selection);
     const threadId = req.params.threadId;
     const nextThreads = session.threads.filter((thread) => thread.id !== threadId);
@@ -827,6 +1220,12 @@ export async function startServer(
     const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
     const session = getOrCreateCommentSession(selection);
     res.json({
+      sessionId: reviewStore.snapshot().session.sessionId,
+      review:
+        createCommentSessionKey(selection) === launchSelectionKey
+          ? reviewStore.snapshot().session
+          : null,
+      selection,
       version: session.version,
       threads: session.threads,
     });
@@ -994,8 +1393,8 @@ export async function startServer(
     res.json({ success: true });
   });
 
-  // Function to output comments when server shuts down
-  function outputFinalComments() {
+  // Print the review's comments as the server shuts down, for a person watching the terminal.
+  function outputFinalComments(): void {
     const session = getOrCreateCommentSession(currentCommentSelection);
     if (session.threads.length > 0) {
       console.log(formatCommentsOutput(session.threads.map(toCommentThread)));
@@ -1012,9 +1411,11 @@ export async function startServer(
     });
 
     fileWatcher.addClient(res);
+    watchResponses.add(res);
 
     req.on('close', () => {
       fileWatcher.removeClient(res);
+      watchResponses.delete(res);
     });
   });
 
@@ -1035,6 +1436,7 @@ export async function startServer(
       res.write('data: heartbeat\n\n');
     }, 5000);
 
+    heartbeatResponses.add(res);
     lifecycle.onConnect(new Date());
     if (idleTimer) {
       clearTimeout(idleTimer);
@@ -1043,6 +1445,8 @@ export async function startServer(
 
     req.on('close', () => {
       clearInterval(heartbeatInterval);
+      heartbeatResponses.delete(res);
+      if (shutdownClaimed) return;
       lifecycle.onDisconnect(new Date());
 
       if (lifecycle.stateAt(new Date()).clients > 0) {
@@ -1051,25 +1455,37 @@ export async function startServer(
 
       // Re-ask the lifecycle once the grace period has had time to elapse, rather
       // than assuming this close was the last one. A reload passes through zero.
-      idleTimer = setTimeout(() => {
+      /** Timer delivery can precede the wall-clock deadline, so preserve the remaining grace. */
+      const checkIdle = (): void => {
         idleTimer = null;
-        if (!lifecycle.stateAt(new Date()).terminal) {
+        if (shutdownClaimed) return;
+        const now = new Date();
+        const state = lifecycle.stateAt(now);
+        if (!state.terminal) {
+          if (state.clients === 0 && state.idleSince !== null) {
+            const remainingMs = state.idleSince.getTime() + idleGraceMs - now.getTime();
+            idleTimer = setTimeout(checkIdle, remainingMs).unref();
+          }
+          return;
+        }
+
+        if (shutdownClaimed) return;
+        reviewStore.finish('browser_idle');
+
+        if (backgroundReview) {
           return;
         }
 
         if (options.keepAlive) {
-          console.log('Review went idle, but the server is staying alive (--keep-alive)');
-          console.log('Press Ctrl+C to stop the server');
+          logHuman('Review went idle, but the server is staying alive (--keep-alive)');
+          logHuman('Press Ctrl+C to stop the server');
           return;
         }
 
-        void (async () => {
-          console.log('Review went idle, shutting down server...');
-          await fileWatcher.stop();
-          outputFinalComments();
-          process.exit(0);
-        })();
-      }, idleGraceMs).unref();
+        logHuman('Review went idle, shutting down server...');
+        startShutdown();
+      };
+      idleTimer = setTimeout(checkIdle, idleGraceMs).unref();
     });
   });
 
@@ -1101,20 +1517,57 @@ export async function startServer(
     });
   }
 
-  const { port, url, server } = await startServerWithFallback(
+  const preferredPort = effectivePreferredPort(options.preferredPort);
+  const listener = await startServerWithFallback(
     app,
-    options.preferredPort || 4966,
+    preferredPort,
     options.host || 'localhost',
+    options.maxPort ?? preferredPort + 99,
+    options.strictPort ?? false,
+    logHuman,
   );
+  const { port, url } = listener;
+  server = listener.server;
   serverBoundToLoopback = isLoopbackAddress(server.address());
 
-  // Guard against the idle-shutdown timer outliving this server: clear it on
-  // close so a stray fire can never reach a torn-down server.
-  server.on('close', () => {
-    if (idleTimer) {
-      clearTimeout(idleTimer);
-      idleTimer = null;
+  publicUrl = resolvePublicUrl(options.publicUrl, port, url);
+  reviewStore.setConnection({
+    publicUrl,
+    apiUrl: listenerApiUrl(server.address()),
+    port,
+    pid: process.pid,
+  });
+
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+
+  process.on('SIGINT', handleSigint);
+  process.on('SIGTERM', handleSigterm);
+
+  // One deadline, owned here. A background review then follows completion into its cleanup; a
+  // foreground one ends the process, unless the user explicitly asked it to stay.
+  reviewTimeoutTimer = setTimeout(() => {
+    reviewStore.finish('review_timeout');
+    if (backgroundReview) return;
+    if (options.keepAlive) {
+      // Keep-alive keeps the server reachable, but the review is over: the page can no longer be
+      // commented on, and saying nothing would leave that looking like a bug.
+      logHuman('Review timed out. The server is staying up (--keep-alive), but input is closed.');
+      logHuman('Press Ctrl+C to stop the server');
+      return;
     }
+    logHuman('Review timed out, shutting down server...');
+    startShutdown();
+  }, reviewTimeoutMs).unref();
+
+  // Guard against lifecycle timers and process handlers outliving this server.
+  server.on('close', () => {
+    clearLifecycleTimers();
+    unsubscribeBroadcast();
+    unsubscribeCleanupScheduler();
+    removeSignalHandlers();
   });
 
   // Security warning for non-localhost binding
@@ -1128,7 +1581,7 @@ export async function startServer(
   // Start file watcher
   if (options.diffMode) {
     try {
-      await fileWatcher.start(options.diffMode, repositoryPath, 300, invalidateCache);
+      await fileWatcher.start(options.diffMode, repositoryPath, 300, invalidateCache, logHuman);
     } catch (error) {
       console.warn('⚠️  File watcher failed to start:', error);
       console.warn('   Continuing without file watching...');
@@ -1146,13 +1599,24 @@ export async function startServer(
     }
   }
 
-  return { port, url, isEmpty: initialDiffData.isEmpty || false, server };
+  return {
+    port,
+    url,
+    isEmpty: initialDiffData.isEmpty || false,
+    server,
+    getReviewSnapshot: () => reviewStore.snapshot(),
+    startShutdown,
+  };
 }
 
 async function startServerWithFallback(
   app: Express,
   preferredPort: number,
   host: string,
+  maxPort: number,
+  strictPort: boolean,
+  log: (message: string) => void,
+  startPort: number = preferredPort,
 ): Promise<{ port: number; url: string; server: Server }> {
   return new Promise((resolve, reject) => {
     // express's listen() method uses listen() method in node:net Server instance internally
@@ -1170,8 +1634,31 @@ async function startServerWithFallback(
       switch (err.code) {
         // Try another port until it succeeds
         case 'EADDRINUSE': {
-          console.log(`Port ${preferredPort} is busy, trying ${preferredPort + 1}...`);
-          return startServerWithFallback(app, preferredPort + 1, host)
+          if (strictPort) {
+            reject(new Error(`Port ${preferredPort} is already in use`));
+            return;
+          }
+
+          if (preferredPort >= maxPort) {
+            reject(
+              new Error(
+                `No free port in range ${startPort}-${maxPort}. ` +
+                  'Free a port or widen --max-port.',
+              ),
+            );
+            return;
+          }
+
+          log(`Port ${preferredPort} is busy, trying ${preferredPort + 1}...`);
+          return startServerWithFallback(
+            app,
+            preferredPort + 1,
+            host,
+            maxPort,
+            strictPort,
+            log,
+            startPort,
+          )
             .then(({ port, url, server }) => {
               resolve({ port, url, server });
             })

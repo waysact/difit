@@ -45,7 +45,7 @@ The detailed procedure is as follows.
 
 - **Reuse before launch**
   - Keep at most one live difit server per Git root and review target. If a difit server you started earlier is still running for the same target, do not launch another or reopen its URL; add the new findings to it with `<difit-command> comment add --port <port> '<json>'` (same JSON shape as `--comment`) and let the open page pick them up.
-  - If review rounds are expected to repeat, launch with `--keep-alive` or `--background` (a detached keep-alive server that prints JSON connection info such as `{"port":4966,"url":"http://localhost:4966","pid":123}` without auto-opening a browser), then use `comment add` / `comment get --port <port>` for later rounds.
+  - If review rounds are expected to repeat, launch with `--keep-alive` or `--background`. `--background` detaches the server and prints one JSON document describing the review — `sessionId`, `publicUrl` to share, `apiUrl` to call, `port`, `pid` and `cursor` — without auto-opening a browser. A background review is bounded: it finishes on its own deadline and then exits after its cleanup grace, so pick `--timeout` and `--cleanup-grace` to suit. Use `comment add` / `comment get --port <port>` for later rounds, or drive the review over REST ([the REST guide](../../docs/agent-review-rest.md)).
 - **difit launch options**
   - Use `<difit-command> <target> [compare-with]` to specify the target diff.
   - For uncommitted changes use `<difit-command> .`, for working tree changes use `<difit-command> working`, and for staged changes use `<difit-command> staged`.

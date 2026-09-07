@@ -9,9 +9,12 @@ import type { ClientWatchState } from '../types/watch';
 import { DiffMode } from '../types/watch';
 
 import App from './App';
+import { storageService } from './services/StorageService';
+import type { PendingReviewEdit } from './utils/reviewEdits';
 import { useDiffComments } from './hooks/useDiffComments';
 import { useViewedFiles } from './hooks/useViewedFiles';
 import { useViewport } from './hooks/useViewport';
+import { useFileWatch } from './hooks/useFileWatch';
 
 // Mock the useViewport hook
 vi.mock('./hooks/useViewport', () => ({
@@ -36,8 +39,8 @@ vi.mock('./hooks/useDiffComments', () => ({
     clearAllComments: mockClearAllComments,
     applyCommentImports: mockApplyCommentImports,
     generatePrompt: vi.fn(),
-    generateThreadPrompt: vi.fn(),
-    generateAllCommentsPrompt: mockGenerateAllCommentsPrompt,
+    generateThreadPrompt: vi.fn(() => ''),
+    generateAllCommentsPrompt: vi.fn(() => ''),
   })),
 }));
 
@@ -90,6 +93,13 @@ Object.defineProperty(navigator, 'sendBeacon', {
   value: vi.fn(),
 });
 
+// Mock the clipboard so the copy handlers' output can be observed
+const mockWriteText = vi.fn(async (_text: string) => {});
+Object.defineProperty(navigator, 'clipboard', {
+  configurable: true,
+  value: { writeText: mockWriteText },
+});
+
 // Mock window.confirm
 const mockConfirm = vi.fn();
 Object.defineProperty(window, 'confirm', {
@@ -124,7 +134,6 @@ let mockComments: DiffCommentThread[] = [];
 const mockReplaceThreads = vi.fn();
 const mockClearAllComments = vi.fn();
 const mockApplyCommentImports = vi.fn(() => []);
-const mockGenerateAllCommentsPrompt = vi.fn(() => 'formatted prompt');
 
 function createMockThread({
   id,
@@ -174,7 +183,6 @@ beforeEach(() => {
   mockViewedFiles = new Set<string>();
   mockHasLoadedInitialViewedFiles = true;
   mockReplaceThreads.mockReset();
-  mockGenerateAllCommentsPrompt.mockClear();
 });
 
 const mockDiffResponse: DiffResponse = {
@@ -224,15 +232,15 @@ describe('App Component - Clear Comments Functionality', () => {
 
       fireEvent.click(await screen.findByText(/Copy All Prompt/));
 
+      // The header carries the requested range, its merge-base separator, and the resolved range.
       await waitFor(() => {
-        expect(mockGenerateAllCommentsPrompt).toHaveBeenCalledWith({
-          requestedBaseCommitish: 'main',
-          requestedTargetCommitish: 'feature/docs-update',
-          baseMode: 'merge-base',
-          resolvedBaseCommitish: 'abcdef1',
-          resolvedTargetCommitish: '1234567',
-        });
+        expect(mockWriteText).toHaveBeenCalledWith(
+          expect.stringContaining('diff main...feature/docs-update (abcdef1...1234567)'),
+        );
       });
+      expect(mockWriteText).toHaveBeenCalledWith(
+        expect.stringContaining('test.ts:L10\nTest comment'),
+      );
     });
   });
 
@@ -418,7 +426,7 @@ describe('App Component - Clear Comments Functionality', () => {
       renderApp();
 
       await waitFor(() => {
-        expect(mockReplaceThreads).toHaveBeenCalledWith(serverThreads);
+        expect(mockReplaceThreads).toHaveBeenCalledWith([{ ...serverThreads[0], resolved: false }]);
       });
 
       expect(vi.mocked(global.fetch)).toHaveBeenCalledWith(
@@ -487,11 +495,15 @@ describe('App Component - Clear Comments Functionality', () => {
         });
       });
 
+      // Server threads reach the app through the review boundary, which normalizes an absent
+      // resolution to false so every consumer of a thread sees the same shape.
+      const normalized = serverThreads.map((thread) => ({ ...thread, resolved: false }));
+
       await waitFor(() => {
-        expect(mockReplaceThreads).toHaveBeenCalledWith(serverThreads);
+        expect(mockReplaceThreads).toHaveBeenCalledWith(normalized);
       });
 
-      expect(mockReplaceThreads).not.toHaveBeenCalledWith([...serverThreads, ...mockComments]);
+      expect(mockReplaceThreads).not.toHaveBeenCalledWith([...normalized, ...mockComments]);
     });
   });
 });
@@ -669,6 +681,77 @@ describe('App Component - Comment sync', () => {
       '/api/comments?base=HEAD%5E&target=HEAD',
       JSON.stringify({ threads: [] }),
     );
+    addEventListenerSpy.mockRestore();
+  });
+
+  it('sends the last read version with a static sync and adopts a merged result', async () => {
+    mockComments = [
+      createMockThread({ id: 'local-1', filePath: 'test.ts', line: 10, body: 'Local comment' }),
+    ];
+    const agentThread = {
+      ...createMockThread({ id: 'agent-1', filePath: 'test.ts', line: 20, body: 'Agent comment' }),
+      resolved: false,
+    };
+    const writes: { threads: DiffCommentThread[]; baseVersion?: number }[] = [];
+    const addEventListenerSpy = vi.spyOn(window, 'addEventListener');
+    vi.mocked(global.fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.startsWith('/api/comments-json')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ review: null, version: 7, threads: [] }),
+        } as Response);
+      }
+      if (url.startsWith('/api/comments')) {
+        const body = JSON.parse(String(init?.body)) as (typeof writes)[number];
+        writes.push(body);
+        // The server saw another writer since version 7, so it merged rather than replaced.
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            success: true,
+            merged: true,
+            version: 8,
+            threads: [...body.threads, agentThread],
+          }),
+        } as Response);
+      }
+      if (url === '/api/revisions') {
+        return Promise.resolve({ ok: true, json: async () => null } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => mockDiffResponse,
+        blob: async () => ({ size: 1024 }),
+      } as Response);
+    });
+
+    renderApp();
+
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toMatchObject({
+      baseVersion: 7,
+      threads: [expect.objectContaining({ id: 'local-1' })],
+    });
+
+    // A merged answer is adopted so the next write does not push the stale local set back.
+    await waitFor(() => {
+      expect(mockReplaceThreads).toHaveBeenLastCalledWith([
+        expect.objectContaining({ id: 'local-1' }),
+        agentThread,
+      ]);
+    });
+    expect(writes).toHaveLength(1);
+
+    // The unload beacon reports the version the merged answer carried.
+    const beforeUnloadHandler = addEventListenerSpy.mock.calls
+      .filter(([eventName]) => eventName === 'beforeunload')
+      .at(-1)?.[1] as (() => void) | undefined;
+    expect(beforeUnloadHandler).toBeDefined();
+    beforeUnloadHandler?.();
+    const beacon = vi.mocked(navigator.sendBeacon).mock.lastCall;
+    expect(beacon?.[0]).toBe('/api/comments?base=HEAD%5E&target=HEAD');
+    expect(JSON.parse(String(beacon?.[1]))).toMatchObject({ baseVersion: 8 });
     addEventListenerSpy.mockRestore();
   });
 
@@ -1113,5 +1196,331 @@ describe('App Component - Mobile sidebar auto-close', () => {
     await waitFor(() => {
       expect(toggleButton).toHaveAttribute('aria-expanded', 'false');
     });
+  });
+});
+
+describe('App Component - Selected review', () => {
+  const reviewSession = {
+    sessionId: 'review-1',
+    selectionKey: 'HEAD^...HEAD',
+    selection: {
+      requestedBase: 'HEAD^',
+      requestedTarget: 'HEAD',
+      resolvedBase: 'HEAD^',
+      resolvedTarget: 'HEAD',
+      baseMode: 'direct',
+    },
+    publicUrl: 'http://localhost:4966',
+    apiUrl: 'http://localhost:4966',
+    port: 4966,
+    pid: 1,
+    state: 'active',
+    reason: null,
+    cursor: 3,
+    finishedCursor: null,
+    finishedAt: null,
+    cleanupAt: null,
+    limits: { idleGraceMs: 10_000, timeoutMs: 3_600_000, cleanupGraceMs: 300_000 },
+  };
+  const serverThread = {
+    ...createMockThread({ id: 'server-1', filePath: 'test.ts', line: 10, body: 'Server comment' }),
+    resolved: false,
+  };
+
+  /** Answer the selected-review bootstrap read; everything else keeps the ordinary diff response. */
+  const mockReviewFetch = ({
+    review,
+    threads,
+    onWrite,
+  }: {
+    review: Record<string, unknown> | null;
+    threads: unknown[];
+    onWrite?: (body: unknown) => Response;
+  }) => {
+    vi.mocked(global.fetch).mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.startsWith('/api/comments-json')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ sessionId: 'review-1', review, version: 1, threads }),
+        } as Response);
+      }
+      if (url.startsWith('/api/comments')) {
+        return Promise.resolve(
+          onWrite?.(JSON.parse(String(init?.body))) ??
+            ({ ok: true, json: async () => ({ version: 2, threads }) } as Response),
+        );
+      }
+      if (url === '/api/revisions') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ specialOptions: [], branches: [], commits: [] }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => mockDiffResponse,
+        blob: async () => ({ size: 1024 }),
+      } as Response);
+    });
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockComments = [];
+    mockConfirm.mockReturnValue(true);
+  });
+
+  it('renders the review server threads rather than local comments', async () => {
+    mockComments = [
+      createMockThread({ id: 'local-only', filePath: 'test.ts', line: 99, body: 'Local only' }),
+    ];
+    mockReviewFetch({ review: reviewSession, threads: [serverThread] });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+
+    expect(await screen.findByText('Server comment')).toBeInTheDocument();
+    expect(screen.queryByText('Local only')).not.toBeInTheDocument();
+  });
+
+  it('copies the displayed thread prompt in review mode', async () => {
+    mockReviewFetch({ review: reviewSession, threads: [serverThread] });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+    fireEvent.click(await screen.findByTitle('Copy thread prompt for AI coding agent'));
+
+    await waitFor(() => expect(mockWriteText).toHaveBeenCalledTimes(1));
+    expect(mockWriteText).toHaveBeenCalledWith(
+      expect.stringContaining('test.ts:L10\nServer comment'),
+    );
+  });
+
+  it('copies every displayed thread prompt in review mode', async () => {
+    mockReviewFetch({ review: reviewSession, threads: [serverThread] });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByText(/Copy All Prompt/));
+
+    await waitFor(() => expect(mockWriteText).toHaveBeenCalledTimes(1));
+    expect(mockWriteText).toHaveBeenCalledWith(
+      expect.stringContaining('test.ts:L10\nServer comment'),
+    );
+  });
+
+  it('says the server could not be reached when a later read fails on a live review', async () => {
+    mockReviewFetch({ review: reviewSession, threads: [serverThread] });
+
+    renderApp();
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+    expect(await screen.findByText('Server comment')).toBeInTheDocument();
+    expect(screen.queryByText(/Could not reach/)).not.toBeInTheDocument();
+
+    const diffFetch = vi.mocked(global.fetch).getMockImplementation();
+    if (diffFetch === undefined) {
+      throw new Error('renderApp installs the fetch mock this test layers a failure onto');
+    }
+    vi.mocked(global.fetch).mockImplementation((input, init) => {
+      if (String(input).startsWith('/api/comments-json')) {
+        return Promise.resolve({ ok: false, status: 502, statusText: 'Bad Gateway' } as Response);
+      }
+      return diffFetch(input, init);
+    });
+    const onCommentsChanged = vi.mocked(useFileWatch).mock.lastCall?.[1];
+    if (onCommentsChanged === undefined) {
+      throw new Error('App passes onCommentsChanged to useFileWatch once a review is selected');
+    }
+    await act(async () => {
+      await expect(onCommentsChanged()).rejects.toThrow('502');
+    });
+
+    expect(
+      await screen.findByText(
+        /Could not reach the review server\. What is shown may be out of date/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Review input closed/)).not.toBeInTheDocument();
+    expect(screen.getByText('Server comment')).toBeInTheDocument();
+  });
+
+  it('marks a resolved thread and does not hide it', async () => {
+    mockReviewFetch({ review: reviewSession, threads: [{ ...serverThread, resolved: true }] });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+
+    expect(await screen.findByText('Server comment')).toBeInTheDocument();
+    expect(screen.getAllByText('Resolved').length).toBeGreaterThan(0);
+  });
+
+  it('closes input and explains why once the review has finished', async () => {
+    mockReviewFetch({
+      review: {
+        ...reviewSession,
+        state: 'finished',
+        reason: 'review_timeout',
+        finishedCursor: 4,
+        finishedAt: '2026-09-05T10:05:00.000Z',
+      },
+      threads: [serverThread],
+    });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+
+    expect(await screen.findByText('Server comment')).toBeInTheDocument();
+    expect(
+      screen.getAllByText(/Review input closed: the review reached its time limit/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText('Write a reply...')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resolve' })).not.toBeInTheDocument();
+  });
+
+  it('keeps a rejected change visible with retry and discard rather than claiming it saved', async () => {
+    mockReviewFetch({
+      review: reviewSession,
+      threads: [serverThread],
+      onWrite: () =>
+        ({
+          ok: false,
+          status: 409,
+          json: async () => ({ error: { code: 'version_conflict' } }),
+        }) as Response,
+    });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Resolve thread' }));
+
+    expect(await screen.findByText('Review conflict')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discard draft' })).toBeInTheDocument();
+  });
+
+  it('leaves a static viewer with no review session on its local behavior', async () => {
+    mockComments = [
+      createMockThread({ id: 'local-only', filePath: 'test.ts', line: 99, body: 'Local only' }),
+    ];
+    mockReviewFetch({ review: null, threads: [] });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+
+    expect(await screen.findByText('Local only')).toBeInTheDocument();
+  });
+
+  it('does not tell the user an active review ended when an earlier draft is waiting', async () => {
+    const earlier: PendingReviewEdit[] = [
+      {
+        kind: 'setResolved',
+        threadId: serverThread.id,
+        before: false,
+        resolved: true,
+        updatedAt: '2026-09-05T10:01:00.000Z',
+      },
+    ];
+    storageService.saveReviewDraft('review-0', 'default:HEAD^:HEAD:direct', earlier);
+    mockReviewFetch({ review: reviewSession, threads: [serverThread] });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+
+    expect(await screen.findByText('Server comment')).toBeInTheDocument();
+    expect(
+      screen.getAllByText(/work from an earlier review of these revisions is still waiting/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText(/no longer active/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/reached its time limit/)).not.toBeInTheDocument();
+  });
+
+  it('renders a review whose stored draft is corrupt instead of crashing', async () => {
+    // Written by hand rather than through saveReviewDraft: the point is a draft no current build
+    // would produce, left behind by an older one or a damaged store.
+    window.localStorage.setItem(
+      `difit-review-draft-v1/review-1/${encodeURIComponent('default:HEAD^:HEAD:direct')}`,
+      JSON.stringify([{ kind: 'createThread', thread: { id: 'x' } }]),
+    );
+    mockReviewFetch({ review: reviewSession, threads: [serverThread] });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+
+    expect(await screen.findByText('Server comment')).toBeInTheDocument();
+    expect(console.error).toHaveBeenCalledWith(
+      'Invalid review draft in localStorage: unrecognized or incomplete edit',
+    );
+    expect(screen.queryByRole('button', { name: 'Discard draft' })).not.toBeInTheDocument();
+  });
+
+  it('offers to discard a stored edit the page cannot replay instead of crashing', async () => {
+    // Bypass the storage check to prove the render itself survives an edit it cannot replay.
+    const shapeless = [
+      { kind: 'createThread', thread: { id: 'x' } },
+    ] as unknown as PendingReviewEdit[];
+    const getReviewDraft = vi.spyOn(storageService, 'getReviewDraft').mockReturnValue(shapeless);
+    mockReviewFetch({ review: reviewSession, threads: [serverThread] });
+
+    try {
+      renderApp();
+
+      fireEvent.click(await screen.findByTitle('More options'));
+      fireEvent.click(await screen.findByText('View All Comments'));
+
+      expect(await screen.findByText('Server comment')).toBeInTheDocument();
+      expect(screen.getByText('Unsaved changes')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Discard draft' }));
+      await waitFor(() => expect(screen.queryByText('Unsaved changes')).not.toBeInTheDocument());
+    } finally {
+      getReviewDraft.mockRestore();
+    }
+  });
+
+  it('warns before unload while review work is still queued', async () => {
+    const addEventListenerSpy = vi.spyOn(window, 'addEventListener');
+    mockReviewFetch({
+      review: reviewSession,
+      threads: [serverThread],
+      onWrite: () => ({ ok: false, status: 409, json: async () => ({}) }) as Response,
+    });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByTitle('More options'));
+    fireEvent.click(await screen.findByText('View All Comments'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Resolve thread' }));
+    await screen.findByText('Review conflict');
+
+    const handler = addEventListenerSpy.mock.calls.find(
+      ([eventName]) => eventName === 'beforeunload',
+    )?.[1] as ((event: BeforeUnloadEvent) => void) | undefined;
+    expect(handler).toBeDefined();
+
+    const event = {
+      preventDefault: vi.fn(),
+      returnValue: undefined,
+    } as unknown as BeforeUnloadEvent;
+    handler?.(event);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(event.returnValue).toBe('');
+    addEventListenerSpy.mockRestore();
   });
 });

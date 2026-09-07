@@ -50,41 +50,61 @@ describe('background process lifecycle', () => {
   });
 
   it('accepts only complete background handshake messages', () => {
-    expect(
-      parseBackgroundHandshakeMessage({
-        port: 4966,
-        url: 'http://localhost:4966',
-        pid: 12345,
-      }),
-    ).toEqual({
+    const handshake = {
+      sessionId: 'review-1',
       port: 4966,
-      url: 'http://localhost:4966',
       pid: 12345,
-    });
-    expect(parseBackgroundHandshakeMessage({ port: 4966 })).toBeNull();
+      publicUrl: 'https://difit-4966.example',
+      apiUrl: 'http://127.0.0.1:4966',
+      url: 'https://difit-4966.example',
+      cursor: 0,
+    };
+
+    expect(parseBackgroundHandshakeMessage({ ...handshake })).toEqual(handshake);
+
+    // A child from an incompatible build must fail readiness visibly rather than hand the parent
+    // a connection description with pieces missing.
+    for (const field of Object.keys(handshake)) {
+      const partial = { ...handshake } as Record<string, unknown>;
+      delete partial[field];
+      expect(parseBackgroundHandshakeMessage(partial)).toBeNull();
+    }
+    expect(parseBackgroundHandshakeMessage({ ...handshake, cursor: '0' })).toBeNull();
+    expect(parseBackgroundHandshakeMessage({ ...handshake, sessionId: '' })).toBeNull();
     expect(parseBackgroundHandshakeMessage('not an object')).toBeNull();
+    expect(parseBackgroundHandshakeMessage(null)).toBeNull();
   });
 
   it('prints the handshake and releases the detached child', async () => {
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
     const stderrDestroy = vi.spyOn(child.stderr, 'destroy');
 
+    const handshake = {
+      sessionId: 'review-1',
+      port: 4967,
+      pid: 42,
+      publicUrl: 'https://difit-4967.example',
+      apiUrl: 'http://127.0.0.1:4967',
+      url: 'https://difit-4967.example',
+      cursor: 0,
+    };
     const result = startBackgroundProcess(spawnProcess);
-    child.emit('message', { port: 4967, url: 'http://localhost:4967', pid: 42 });
+    child.emit('message', handshake);
     await result;
 
+    // The launcher no longer forces --keep-alive: a background review is bounded by the server's
+    // own deadline and cleanup, and an inherited keep-alive would have made it immortal.
     expect(spawnProcess).toHaveBeenCalledWith(
       process.execPath,
-      ['/tmp/difit-entry.js', 'HEAD', '--keep-alive', '--no-open'],
+      ['/tmp/difit-entry.js', 'HEAD', '--no-open'],
       expect.objectContaining({
         detached: true,
         stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
         env: expect.objectContaining({ [BACKGROUND_CHILD_ENV]: '1' }),
       }),
     );
-    expect(consoleLog).toHaveBeenCalledWith(
-      JSON.stringify({ port: 4967, url: 'http://localhost:4967', pid: 42 }),
-    );
+    expect(consoleLog).toHaveBeenCalledWith(JSON.stringify(handshake));
+    expect(consoleLog).toHaveBeenCalledOnce();
     expect(child.disconnect).toHaveBeenCalledOnce();
     expect(stderrDestroy).toHaveBeenCalledOnce();
     expect(child.unref).toHaveBeenCalledOnce();
@@ -128,5 +148,20 @@ describe('background process lifecycle', () => {
     expect(child.listenerCount('message')).toBe(0);
     expect(child.listenerCount('error')).toBe(0);
     expect(child.listenerCount('close')).toBe(0);
+  });
+
+  it('fails readiness at once when the child describes the review in an unusable shape', async () => {
+    vi.useFakeTimers();
+    const result = startBackgroundProcess(spawnProcess);
+    const assertion = expect(result).rejects.toThrow(/unusable readiness message.*port, url, pid/);
+
+    // The shape an older build sends. Waiting the 10s startup timeout out would report this as a
+    // slow start, which is the wrong diagnosis and the wrong thing to retry.
+    child.emit('message', { port: 4967, url: 'http://localhost:4967', pid: 42 });
+    await vi.advanceTimersByTimeAsync(0);
+
+    await assertion;
+    expect(child.kill).toHaveBeenCalled();
+    expect(child.listenerCount('message')).toBe(0);
   });
 });

@@ -9,9 +9,11 @@ import {
   type ViewedHashIndexEntry,
 } from '../../types/diff';
 import { normalizeBaseMode } from '../../utils/diffSelection';
+import { isPendingReviewEdit, type PendingReviewEdit } from '../utils/reviewEdits';
 
 const STORAGE_KEY_PREFIX = 'difit-storage-v1';
 const VIEWED_INDEX_PREFIX = 'difit-viewed-index-v1';
+const REVIEW_DRAFT_PREFIX = 'difit-review-draft-v1';
 const DEFAULT_REPO_ID = '__default__';
 const MAX_VIEWED_INDEX_ENTRIES = 5000;
 export const VIEWED_HASH_VERSION = 1;
@@ -57,6 +59,11 @@ function normalizeRootComment(thread: DiffCommentThread): LegacyDiffComment | nu
 }
 
 export class StorageService {
+  /** Keep pending review intent separate from ordinary diff-context comments. */
+  private getReviewDraftKey(sessionId: string, selectionKey: string): string {
+    return `${REVIEW_DRAFT_PREFIX}/${encodeURIComponent(sessionId)}/${encodeURIComponent(selectionKey)}`;
+  }
+
   /**
    * Generate a filesystem-safe storage key from commitish references
    */
@@ -394,6 +401,81 @@ export class StorageService {
       repositoryId,
       baseMode,
     );
+  }
+
+  /**
+   * Accept only entries this build knows how to replay. A draft is user data that survives a
+   * reload and a version change, so a malformed entry must be dropped here rather than thrown from
+   * inside the render that projects it.
+   */
+  private parseReviewDraft(raw: string): PendingReviewEdit[] | null {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      console.error('Invalid review draft in localStorage: expected an array');
+      return null;
+    }
+    // The same predicate the replay applies, so nothing accepted here can surprise it there.
+    if (!parsed.every(isPendingReviewEdit)) {
+      console.error('Invalid review draft in localStorage: unrecognized or incomplete edit');
+      return null;
+    }
+    return parsed;
+  }
+
+  /** Read pending browser work for the exact review process and selected revision pair. */
+  getReviewDraft(sessionId: string, selectionKey: string): PendingReviewEdit[] | null {
+    try {
+      const raw = localStorage.getItem(this.getReviewDraftKey(sessionId, selectionKey));
+      if (!raw) return null;
+      return this.parseReviewDraft(raw);
+    } catch (error) {
+      console.error('Error reading review draft:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Find drafts left by any review process for this selection. A review that ended while the tab
+   * was closed leaves work stored under a session id the next process will never use, so recovery
+   * has to search by selection rather than by session.
+   */
+  getReviewDraftsForSelection(
+    selectionKey: string,
+  ): { sessionId: string; edits: PendingReviewEdit[] }[] {
+    const prefix = `${REVIEW_DRAFT_PREFIX}/`;
+    const suffix = `/${encodeURIComponent(selectionKey)}`;
+    const drafts: { sessionId: string; edits: PendingReviewEdit[] }[] = [];
+    try {
+      for (let index = 0; index < localStorage.length; index += 1) {
+        const key = localStorage.key(index);
+        if (!key?.startsWith(prefix) || !key.endsWith(suffix)) continue;
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const edits = this.parseReviewDraft(raw);
+        if (!edits || edits.length === 0) continue;
+        drafts.push({
+          sessionId: decodeURIComponent(key.slice(prefix.length, key.length - suffix.length)),
+          edits,
+        });
+      }
+    } catch (error) {
+      console.error('Error reading review drafts for selection:', error);
+    }
+    return drafts;
+  }
+
+  /** Persist unsaved browser intent without treating it as an acknowledged review snapshot. */
+  saveReviewDraft(sessionId: string, selectionKey: string, edits: PendingReviewEdit[]): void {
+    try {
+      const key = this.getReviewDraftKey(sessionId, selectionKey);
+      if (edits.length === 0) {
+        localStorage.removeItem(key);
+        return;
+      }
+      localStorage.setItem(key, JSON.stringify(edits));
+    } catch (error) {
+      console.error('Error saving review draft:', error);
+    }
   }
 
   /**

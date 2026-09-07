@@ -38,11 +38,19 @@ interface CommentsChangedWatchEvent {
   timestamp: string;
 }
 
+interface ReviewChangedWatchEvent {
+  type: 'reviewChanged';
+  sessionId: string;
+  cursor: number;
+  timestamp: string;
+}
+
 export type WatchEvent =
   | ConnectedWatchEvent
   | ReloadWatchEvent
   | ErrorWatchEvent
-  | CommentsChangedWatchEvent;
+  | CommentsChangedWatchEvent
+  | ReviewChangedWatchEvent;
 
 export interface ClientWatchState {
   isWatchEnabled: boolean;

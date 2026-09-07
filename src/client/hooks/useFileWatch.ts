@@ -3,6 +3,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { DiffMode, type ClientWatchState, type WatchEvent } from '../../types/watch.js';
 import { resolveEventSourceUrl } from '../utils/eventSourceUrl';
 
+/** Distinguishes a failed comment read from a lost stream, so clearing one cannot hide the other. */
+const REFRESH_FAILURE_MESSAGE = 'Lost contact with the server while refreshing comments';
+
 interface FileWatchHook {
   shouldReload: boolean;
   isConnected: boolean;
@@ -11,6 +14,13 @@ interface FileWatchHook {
   watchState: ClientWatchState;
 }
 
+/**
+ * Subscribe to the server's watch stream.
+ *
+ * `onCommentsChanged` must be referentially stable. It is captured when the connection is opened,
+ * and it is now also invoked on connect, on reconnect and when the tab regains focus, so an
+ * identity that changes on every render would turn each refresh into another reconnect and refresh.
+ */
 export function useFileWatch(
   onReload?: () => Promise<void>,
   onCommentsChanged?: () => Promise<void>,
@@ -18,6 +28,8 @@ export function useFileWatch(
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptsRef = useRef(0);
+  const refreshInFlightRef = useRef(false);
+  const refreshAgainRef = useRef(false);
   const maxReconnectAttempts = 5;
   const reconnectDelay = 3000; // 3 seconds
 
@@ -33,9 +45,50 @@ export function useFileWatch(
 
   const [error, setError] = useState<string | null>(null);
 
+  /**
+   * Run one comment refresh at a time and report its failure instead of dropping it. The server
+   * broadcasts a comment change and a review change for the same mutation, and a focused tab can
+   * ask at the same moment, so a request arriving mid-flight is collapsed into a single repeat
+   * rather than a second concurrent read.
+   */
+  const requestCommentsRefresh = useCallback(() => {
+    if (!onCommentsChanged) return;
+    if (refreshInFlightRef.current) {
+      refreshAgainRef.current = true;
+      return;
+    }
+
+    refreshInFlightRef.current = true;
+    void (async () => {
+      try {
+        do {
+          refreshAgainRef.current = false;
+          try {
+            await onCommentsChanged();
+            setError((current) => (current === REFRESH_FAILURE_MESSAGE ? null : current));
+          } catch (refreshError) {
+            // A request that arrived during this attempt announced state the attempt never read,
+            // so it is still owed a read: fall through to the loop rather than dropping it.
+            console.error('Failed to refresh comments after a watch notification:', refreshError);
+            setError(REFRESH_FAILURE_MESSAGE);
+          }
+        } while (refreshAgainRef.current);
+      } finally {
+        refreshInFlightRef.current = false;
+      }
+    })();
+  }, [onCommentsChanged]);
+
   const connectToWatch = useCallback(() => {
     if (eventSourceRef.current) {
       return; // Already connected
+    }
+
+    // Take ownership of the reconnect slot. Without this an earlier pending retry survives, is
+    // overwritten in the ref by the next one, and outlives cleanup to open a stream nobody owns.
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
     }
 
     try {
@@ -50,6 +103,7 @@ export function useFileWatch(
         }));
         reconnectAttemptsRef.current = 0;
         setError(null);
+        requestCommentsRefresh();
       };
 
       eventSource.onmessage = (event) => {
@@ -83,9 +137,8 @@ export function useFileWatch(
               break;
 
             case 'commentsChanged':
-              if (onCommentsChanged) {
-                void onCommentsChanged();
-              }
+            case 'reviewChanged':
+              requestCommentsRefresh();
               break;
           }
         } catch (parseError) {
@@ -131,7 +184,7 @@ export function useFileWatch(
       console.error('Failed to connect to file watch service:', connectionError);
       setError('Failed to connect to file watch service');
     }
-  }, [maxReconnectAttempts, onCommentsChanged, reconnectDelay]);
+  }, [maxReconnectAttempts, reconnectDelay, requestCommentsRefresh]);
 
   const handleReload = useCallback(async () => {
     if (watchState.isReloading) {
@@ -190,6 +243,33 @@ export function useFileWatch(
   useEffect(() => {
     return cleanup;
   }, []);
+
+  // Returning to the tab is the last line of defence against a missed notification: the hook gives
+  // up reconnecting after five attempts, so a sleep longer than that leaves the stream dead with no
+  // further onopen to reset it.
+  useEffect(() => {
+    if (!onCommentsChanged) return undefined;
+
+    const refreshOnAttention = () => {
+      if (!eventSourceRef.current) {
+        reconnectAttemptsRef.current = 0;
+        connectToWatch();
+      }
+      requestCommentsRefresh();
+    };
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        refreshOnAttention();
+      }
+    };
+
+    window.addEventListener('focus', refreshOnAttention);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    return () => {
+      window.removeEventListener('focus', refreshOnAttention);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+    };
+  }, [connectToWatch, onCommentsChanged, requestCommentsRefresh]);
 
   return {
     shouldReload: watchState.shouldReload,

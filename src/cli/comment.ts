@@ -1,6 +1,8 @@
 import { Command, Option } from 'commander';
 
 import { parseCommentImportValue } from '../utils/commentImports.js';
+import type { DiffSelection } from '../types/diff.js';
+import type { ReviewInfo } from '../types/review.js';
 
 import { detectStdinSource, readStdin } from './utils.js';
 
@@ -9,6 +11,51 @@ interface CommentImportResponse {
   importId?: string;
   count?: number;
   warnings?: string[];
+}
+
+interface CommentBootstrap {
+  sessionId: string;
+  version: number;
+  selection: DiffSelection;
+  review: ReviewInfo | null;
+}
+
+async function responseError(response: Response): Promise<string> {
+  // A proxy or a replacement process may answer with HTML. The status is the useful part then, and
+  // a `resolve` loop must keep going for its remaining threads instead of dying on a parse error.
+  const body = (await response.json().catch(() => ({}))) as {
+    error?: string | { code: string; message: string };
+  };
+  if (typeof body.error === 'string') return body.error;
+  if (body.error) return `${body.error.code}: ${body.error.message}`;
+  return `Comment request failed (${response.status})`;
+}
+
+/** Pin one read so a browser navigation or replacement process cannot redirect queued writes. */
+async function readCommentBootstrap(port: number): Promise<CommentBootstrap> {
+  const response = await fetch(`http://localhost:${port}/api/comments-json`);
+  if (!response.ok) throw new Error(await responseError(response));
+  const data = (await response.json()) as CommentBootstrap;
+  if (
+    !data.selection ||
+    typeof data.sessionId !== 'string' ||
+    !Number.isSafeInteger(data.version) ||
+    data.version < 0 ||
+    data.review === undefined
+  ) {
+    throw new Error(
+      'Server does not provide review preconditions; update difit and read comments again',
+    );
+  }
+  return data;
+}
+
+function selectionQuery(bootstrap: CommentBootstrap): URLSearchParams {
+  return new URLSearchParams({
+    base: bootstrap.selection.baseCommitish,
+    target: bootstrap.selection.targetCommitish,
+    baseMode: bootstrap.selection.baseMode ?? 'direct',
+  });
 }
 
 function handleCommandError(error: unknown, port: number): never {
@@ -51,19 +98,24 @@ export function createCommentCommand(): Command {
       try {
         const input = await parseCommentAddInput(json);
         const imports = parseCommentImportValue(input);
+        const bootstrap = await readCommentBootstrap(opts.port);
 
-        const response = await fetch(`http://localhost:${opts.port}/api/comment-imports`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(imports),
-        });
+        const response = await fetch(
+          `http://localhost:${opts.port}/api/comment-imports?${selectionQuery(bootstrap)}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(bootstrap.review ? { 'X-Difit-Session': bootstrap.sessionId } : {}),
+            },
+            body: JSON.stringify(
+              bootstrap.review ? { imports, baseVersion: bootstrap.version } : imports,
+            ),
+          },
+        );
 
         if (!response.ok) {
-          const errorBody = (await response.json().catch(() => ({}))) as {
-            error?: string;
-          };
-          console.error(`Error: ${errorBody.error ?? 'Failed to add comments'}`);
-          process.exit(1);
+          throw new Error(await responseError(response));
         }
 
         const result = (await response.json()) as CommentImportResponse;
@@ -119,39 +171,42 @@ export function createCommentCommand(): Command {
     .requiredOption('--port <port>', 'port of the running difit server', parseInt)
     .action(async (threadIds: string[], opts: { port: number }) => {
       try {
-        const results = await Promise.all(
-          threadIds.map(
-            async (
-              threadId,
-            ): Promise<{
-              threadId: string;
-              status: 'resolved' | 'notFound' | 'error';
-              error?: string;
-            }> => {
-              const response = await fetch(
-                `http://localhost:${opts.port}/api/comments/${encodeURIComponent(threadId)}`,
-                { method: 'DELETE' },
-              );
-
-              if (response.ok) {
-                return { threadId, status: 'resolved' };
-              }
-
-              if (response.status === 404) {
-                return { threadId, status: 'notFound' };
-              }
-
-              const errorBody = (await response.json().catch(() => ({}))) as {
-                error?: string;
-              };
-              return {
-                threadId,
-                status: 'error',
-                error: errorBody.error ?? `Failed to resolve thread ${threadId}`,
-              };
+        const bootstrap = await readCommentBootstrap(opts.port);
+        let version = bootstrap.version;
+        let blocked: string | undefined;
+        const results: Array<{
+          threadId: string;
+          status: 'resolved' | 'notFound' | 'error';
+          error?: string;
+        }> = [];
+        for (const threadId of threadIds) {
+          if (blocked) {
+            results.push({ threadId, status: 'error', error: blocked });
+            continue;
+          }
+          const query = selectionQuery(bootstrap);
+          if (bootstrap.review) query.set('expectedVersion', String(version));
+          const response = await fetch(
+            `http://localhost:${opts.port}/api/comments/${encodeURIComponent(threadId)}?${query}`,
+            {
+              method: 'DELETE',
+              ...(bootstrap.review ? { headers: { 'X-Difit-Session': bootstrap.sessionId } } : {}),
             },
-          ),
-        );
+          );
+          if (response.ok) {
+            if (bootstrap.review) {
+              const body = (await response.json()) as { version: number };
+              version = body.version;
+            }
+            results.push({ threadId, status: 'resolved' });
+          } else if (response.status === 404) {
+            results.push({ threadId, status: 'notFound' });
+          } else {
+            const error = await responseError(response);
+            results.push({ threadId, status: 'error', error });
+            if (bootstrap.review) blocked = error;
+          }
+        }
 
         const resolved = results.filter((r) => r.status === 'resolved').map((r) => r.threadId);
         const notFound = results.filter((r) => r.status === 'notFound').map((r) => r.threadId);

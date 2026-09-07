@@ -38,9 +38,12 @@ interface DiffViewerProps {
   ) => Promise<void>;
   onGenerateThreadPrompt: (thread: CommentThread) => string;
   onRemoveThread: (threadId: string) => void;
+  onSetResolved?: (threadId: string, resolved: boolean) => void;
   onReplyToThread: (threadId: string, body: string) => Promise<void>;
   onRemoveMessage: (threadId: string, messageId: string) => void;
   onUpdateMessage: (threadId: string, messageId: string, newBody: string) => void;
+  commentsReadOnly?: boolean;
+  reviewInputClosedReason?: string | null;
   onOpenInEditor?: (filePath: string, lineNumber: number) => void;
   syntaxTheme?: AppearanceSettings['syntaxTheme'];
   baseCommitish?: string;
@@ -189,9 +192,12 @@ export const DiffViewer = memo(function DiffViewer({
   onAddComment,
   onGenerateThreadPrompt,
   onRemoveThread,
+  onSetResolved,
   onReplyToThread,
   onRemoveMessage,
   onUpdateMessage,
+  commentsReadOnly = false,
+  reviewInputClosedReason,
   onOpenInEditor,
   syntaxTheme,
   baseCommitish,
@@ -351,9 +357,12 @@ export const DiffViewer = memo(function DiffViewer({
     onAddComment: handleAddComment,
     onGenerateThreadPrompt,
     onRemoveThread,
+    onSetResolved,
     onReplyToThread,
     onRemoveMessage,
     onUpdateMessage,
+    commentsReadOnly,
+    reviewInputClosedReason,
     onOpenInEditor,
     onLineClick,
     commentTrigger,

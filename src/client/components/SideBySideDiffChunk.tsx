@@ -37,9 +37,12 @@ interface SideBySideDiffChunkProps {
   ) => Promise<void>;
   onGenerateThreadPrompt: (thread: CommentThread) => string;
   onRemoveThread: (threadId: string) => void;
+  onSetResolved?: (threadId: string, resolved: boolean) => void;
   onReplyToThread: (threadId: string, body: string) => Promise<void>;
   onRemoveMessage: (threadId: string, messageId: string) => void;
   onUpdateMessage: (threadId: string, messageId: string, newBody: string) => void;
+  commentsReadOnly?: boolean;
+  reviewInputClosedReason?: string | null;
   syntaxTheme?: AppearanceSettings['syntaxTheme'];
   cursor?: CursorPosition | null;
   fileIndex?: number;
@@ -148,9 +151,12 @@ export function SideBySideDiffChunk({
   onAddComment,
   onGenerateThreadPrompt,
   onRemoveThread,
+  onSetResolved,
   onReplyToThread,
   onRemoveMessage,
   onUpdateMessage,
+  commentsReadOnly = false,
+  reviewInputClosedReason,
   syntaxTheme,
   cursor = null,
   fileIndex = 0,
@@ -174,6 +180,10 @@ export function SideBySideDiffChunk({
   // Handle comment trigger from keyboard navigation
   useEffect(() => {
     if (commentTrigger?.lineIndex !== undefined) {
+      if (commentsReadOnly) {
+        onCommentTriggerHandled?.();
+        return;
+      }
       const line = chunk.lines[commentTrigger.lineIndex];
       if (line && line.type !== 'delete') {
         const lineNumber = line.newLineNumber;
@@ -183,17 +193,24 @@ export function SideBySideDiffChunk({
         }
       }
     }
-  }, [commentTrigger, chunk.lines, onCommentTriggerHandled]);
+  }, [commentTrigger, chunk.lines, commentsReadOnly, onCommentTriggerHandled]);
+
+  // A form already open when the review closes would otherwise keep a Submit that silently
+  // discards what the user typed.
+  useEffect(() => {
+    if (commentsReadOnly) setCommentingLine(null);
+  }, [commentsReadOnly]);
 
   const handleAddComment = useCallback(
     (side: DiffSide, lineNumber: LineNumber) => {
+      if (commentsReadOnly) return;
       if (commentingLine?.side === side && commentingLine?.lineNumber === lineNumber) {
         setCommentingLine(null);
       } else {
         setCommentingLine({ side, lineNumber });
       }
     },
-    [commentingLine],
+    [commentingLine, commentsReadOnly],
   );
 
   const getCommentLineFromAnchor = (selection: LineSelection): LineNumber => {
@@ -676,18 +693,20 @@ export function SideBySideDiffChunk({
                                 }}
                               />
                             )}
-                          <CommentButton
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              if (e.shiftKey) {
-                                e.preventDefault();
-                              }
-                              handleCommentButtonMouseDown({
-                                isShiftClick: e.shiftKey,
-                                selection: oldSelection,
-                              });
-                            }}
-                          />
+                          {!commentsReadOnly && (
+                            <CommentButton
+                              onMouseDown={(e) => {
+                                e.stopPropagation();
+                                if (e.shiftKey) {
+                                  e.preventDefault();
+                                }
+                                handleCommentButtonMouseDown({
+                                  isShiftClick: e.shiftKey,
+                                  selection: oldSelection,
+                                });
+                              }}
+                            />
+                          )}
                         </>
                       )}
                   </td>
@@ -735,18 +754,20 @@ export function SideBySideDiffChunk({
                               }}
                             />
                           )}
-                          <CommentButton
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              if (e.shiftKey) {
-                                e.preventDefault();
-                              }
-                              handleCommentButtonMouseDown({
-                                isShiftClick: e.shiftKey,
-                                selection: newSelection,
-                              });
-                            }}
-                          />
+                          {!commentsReadOnly && (
+                            <CommentButton
+                              onMouseDown={(e) => {
+                                e.stopPropagation();
+                                if (e.shiftKey) {
+                                  e.preventDefault();
+                                }
+                                handleCommentButtonMouseDown({
+                                  isShiftClick: e.shiftKey,
+                                  selection: newSelection,
+                                });
+                              }}
+                            />
+                          )}
                         </>
                       )}
                   </td>
@@ -811,9 +832,12 @@ export function SideBySideDiffChunk({
                                   showAuthorBadges={showAuthorBadges}
                                   onGeneratePrompt={onGenerateThreadPrompt}
                                   onRemoveThread={onRemoveThread}
+                                  onSetResolved={onSetResolved}
                                   onReplyToThread={onReplyToThread}
                                   onRemoveMessage={onRemoveMessage}
                                   onUpdateMessage={onUpdateMessage}
+                                  inputClosed={commentsReadOnly}
+                                  inputClosedReason={reviewInputClosedReason}
                                   syntaxTheme={syntaxTheme}
                                 />
                               </div>

@@ -20,9 +20,12 @@ export function TextDiffViewer({
   onAddComment,
   onGenerateThreadPrompt,
   onRemoveThread,
+  onSetResolved,
   onReplyToThread,
   onRemoveMessage,
   onUpdateMessage,
+  commentsReadOnly,
+  reviewInputClosedReason,
   onLineClick,
   onOpenInEditor,
   commentTrigger,
@@ -106,9 +109,12 @@ export function TextDiffViewer({
                 onAddComment={onAddComment}
                 onGenerateThreadPrompt={onGenerateThreadPrompt}
                 onRemoveThread={onRemoveThread}
+                onSetResolved={onSetResolved}
                 onReplyToThread={onReplyToThread}
                 onRemoveMessage={onRemoveMessage}
                 onUpdateMessage={onUpdateMessage}
+                commentsReadOnly={commentsReadOnly}
+                reviewInputClosedReason={reviewInputClosedReason}
                 onOpenInEditor={onOpenInEditor}
                 mode={diffMode}
                 syntaxTheme={syntaxTheme}

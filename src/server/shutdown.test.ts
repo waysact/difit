@@ -26,30 +26,36 @@ describe('runBoundedShutdown', () => {
    * CLI's SIGINT and `--timeout` exits, so a claimant whose cleanup never
    * settles leaves the run unkillable short of SIGKILL.
    */
-  it('exits anyway when the cleanup never settles', async () => {
+  it('reports timeout and exits unsuccessfully when cleanup never settles', async () => {
     const exit = vi.fn();
+    const reportError = vi.fn();
 
     void runBoundedShutdown({
       run: () => new Promise<void>(() => {}),
       exit,
       exitCode: 0,
       timeoutMs: 50,
+      reportError,
     });
 
     await vi.advanceTimersByTimeAsync(49);
     expect(exit).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(1);
-    expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+    expect(reportError).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ message: 'Timed out while waiting for shutdown cleanup' }),
+    );
+    expect(exit).toHaveBeenCalledExactlyOnceWith(1);
   });
 
-  it('reports the claiming path’s own exit code when it forces the exit', async () => {
+  it('preserves a signal failure exit code when cleanup never settles', async () => {
     const exit = vi.fn();
 
     void runBoundedShutdown({
       run: () => new Promise<void>(() => {}),
       exit,
       exitCode: 130,
+      failureExitCode: 130,
       timeoutMs: 50,
     });
     await vi.advanceTimersByTimeAsync(50);
@@ -78,19 +84,23 @@ describe('runBoundedShutdown', () => {
     expect(exit).toHaveBeenCalledExactlyOnceWith(0);
   });
 
-  // A cleanup that throws is a real failure: it must reach the caller as a
-  // rejection (which Node turns into exit 1) rather than be reported as the
-  // orderly exit code.
-  it('rethrows a failing cleanup without exiting', async () => {
+  it('reports and exits unsuccessfully when cleanup rejects', async () => {
     const exit = vi.fn();
+    const reportError = vi.fn();
     const error = new Error('watcher teardown failed');
 
     await expect(
-      runBoundedShutdown({ run: () => Promise.reject(error), exit, exitCode: 0, timeoutMs: 50 }),
+      runBoundedShutdown({
+        run: () => Promise.reject(error),
+        exit,
+        exitCode: 0,
+        timeoutMs: 50,
+        reportError,
+      }),
     ).rejects.toBe(error);
 
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(exit).not.toHaveBeenCalled();
+    expect(reportError).toHaveBeenCalledExactlyOnceWith(error);
+    expect(exit).toHaveBeenCalledExactlyOnceWith(1);
   });
 
   it('defaults to SHUTDOWN_WATCHDOG_MS when no timeout is given', async () => {
@@ -102,7 +112,7 @@ describe('runBoundedShutdown', () => {
     expect(exit).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(1);
-    expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+    expect(exit).toHaveBeenCalledExactlyOnceWith(1);
   });
 
   // unref()'d, so a pending watchdog can never be the reason a process that

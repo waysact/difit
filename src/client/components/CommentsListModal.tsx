@@ -14,11 +14,14 @@ interface CommentsListModalProps {
   comments: CommentThread[];
   showAuthorBadges?: boolean;
   onRemoveThread: (threadId: string) => void;
+  onSetResolved?: (threadId: string, resolved: boolean) => void;
   onGenerateThreadPrompt: (thread: CommentThread) => string;
   onReplyToThread: (threadId: string, body: string) => Promise<void>;
   onRemoveMessage: (threadId: string, messageId: string) => void;
   onUpdateMessage: (threadId: string, messageId: string, newBody: string) => void;
   syntaxTheme?: AppearanceSettings['syntaxTheme'];
+  inputClosed?: boolean;
+  inputClosedReason?: string | null;
 }
 
 export function CommentsListModal({
@@ -28,11 +31,14 @@ export function CommentsListModal({
   comments,
   showAuthorBadges = false,
   onRemoveThread,
+  onSetResolved,
   onGenerateThreadPrompt,
   onReplyToThread,
   onRemoveMessage,
   onUpdateMessage,
   syntaxTheme,
+  inputClosed = false,
+  inputClosedReason,
 }: CommentsListModalProps) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const commentRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -59,15 +65,21 @@ export function CommentsListModal({
 
   const handleDeleteThread = useCallback(
     (thread: CommentThread) => {
+      if (inputClosed) return;
       const preview = thread.messages[0]?.body || '';
-      if (confirm(`Resolve this thread?\n\n"${preview}"`)) {
-        onRemoveThread(thread.id);
+      const action = thread.resolved ? 'Reopen' : 'Resolve';
+      if (confirm(`${action} this thread?\n\n"${preview}"`)) {
+        if (onSetResolved) {
+          onSetResolved(thread.id, !thread.resolved);
+        } else {
+          onRemoveThread(thread.id);
+        }
         if (selectedIndex >= sortedThreads.length - 1 && selectedIndex > 0) {
           setSelectedIndex(selectedIndex - 1);
         }
       }
     },
-    [onRemoveThread, selectedIndex, sortedThreads.length],
+    [inputClosed, onRemoveThread, onSetResolved, selectedIndex, sortedThreads.length],
   );
 
   useEffect(() => {
@@ -152,6 +164,11 @@ export function CommentsListModal({
             <span className="font-mono">d</span> to resolve • <span className="font-mono">Esc</span>{' '}
             to close
           </div>
+          {inputClosedReason && (
+            <p className="mt-2 text-xs text-github-text-secondary">
+              Review input closed: {inputClosedReason}
+            </p>
+          )}
         </div>
 
         <div className="max-h-[calc(80vh-120px)] overflow-y-auto">
@@ -179,10 +196,13 @@ export function CommentsListModal({
                             handleDeleteThread(thread);
                           }
                         }}
+                        onSetResolved={onSetResolved}
                         onReplyToThread={onReplyToThread}
                         onRemoveMessage={onRemoveMessage}
                         onUpdateMessage={onUpdateMessage}
                         syntaxTheme={syntaxTheme}
+                        inputClosed={inputClosed}
+                        inputClosedReason={inputClosedReason}
                         onClick={(e) => {
                           e.stopPropagation();
                           setSelectedIndex(index);

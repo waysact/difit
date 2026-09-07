@@ -8,6 +8,7 @@ interface CommentsDropdownProps {
   isCopiedAll: boolean;
   onCopyAll: () => void;
   onDeleteAll: () => void;
+  canDeleteAll?: boolean;
   onViewAll?: () => void;
   direction?: 'down' | 'up';
   compact?: boolean;
@@ -18,6 +19,7 @@ export function CommentsDropdown({
   isCopiedAll,
   onCopyAll,
   onDeleteAll,
+  canDeleteAll = true,
   onViewAll,
   direction = 'down',
   compact = false,
@@ -127,13 +129,15 @@ export function CommentsDropdown({
               View All Comments
             </button>
           )}
-          <button
-            onClick={handleDeleteAll}
-            className="w-full text-left px-3 py-2 text-xs flex items-center gap-2 text-github-text-primary hover:bg-github-bg-tertiary transition-colors"
-          >
-            <Eraser size={12} />
-            Cleanup All Prompt
-          </button>
+          {canDeleteAll && (
+            <button
+              onClick={handleDeleteAll}
+              className="w-full text-left px-3 py-2 text-xs flex items-center gap-2 text-github-text-primary hover:bg-github-bg-tertiary transition-colors"
+            >
+              <Eraser size={12} />
+              Cleanup All Prompt
+            </button>
+          )}
         </div>
       )}
     </div>

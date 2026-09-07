@@ -6,6 +6,7 @@ import type { SimpleGit } from 'simple-git';
 
 import type { CommentImport } from '../types/diff.js';
 import { parseCommentImportValue } from '../utils/commentImports.js';
+import { effectivePreferredPort } from '../utils/ports.js';
 
 type StdinStat = Pick<Stats, 'isFIFO' | 'isFile' | 'isSocket'>;
 
@@ -185,31 +186,157 @@ export function parseCommentOptions(commentValues: string[]): CommentImport[] {
  */
 export const MAX_IDLE_GRACE_SECONDS = 2_147_483;
 
+const MAX_TCP_PORT = 65_535;
+
 /**
- * Validates a parsed `--idle-grace <seconds>` value.
- *
- * `parseInt` turns a typo like `--idle-grace abc` into `NaN`. `??` does not
- * catch `NaN`, so it would reach `ReviewLifecycle` unvalidated: `x >= NaN` is
- * always `false`, so the review can never be reported terminal and the
- * server never exits. Reject anything that is not a non-negative integer,
- * or that exceeds `MAX_IDLE_GRACE_SECONDS`, before it gets that far.
+ * Validates a parsed `<port>` value for a `--port`/`--max-port`-shaped flag:
+ * an integer within the TCP port range. `parseInt` turns a typo like
+ * `--port abc` into `NaN`, which `startServer` would silently treat as
+ * "not given" instead of reporting -- reject it up front instead. Shared by
+ * `validatePort` and `validateMaxPort`, which both need this same check
+ * before applying any rule of their own.
  */
-export function validateIdleGraceSeconds(value: number | undefined): {
-  valid: boolean;
-  error?: string;
-} {
-  if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
-    return { valid: false, error: '--idle-grace must be a non-negative integer' };
+function validatePortNumber(
+  flagName: string,
+  port: number | undefined,
+): { valid: boolean; error?: string } {
+  if (port === undefined) {
+    return { valid: true };
   }
 
-  if (value !== undefined && value > MAX_IDLE_GRACE_SECONDS) {
+  if (!Number.isInteger(port) || port < 1 || port > MAX_TCP_PORT) {
+    return { valid: false, error: `${flagName} must be an integer between 1 and ${MAX_TCP_PORT}` };
+  }
+
+  return { valid: true };
+}
+
+export function validatePort(port: number | undefined): { valid: boolean; error?: string } {
+  return validatePortNumber('--port', port);
+}
+
+/**
+ * Validates a parsed `--max-port <port>` value against the port the search starts
+ * from. A ceiling below the starting port cannot be met by a search that only
+ * counts upwards, and it renders the exhaustion message as a backwards range
+ * (`No free port in range 5000-4900`).
+ */
+export function validateMaxPort(
+  maxPort: number | undefined,
+  preferredPort: number | undefined,
+): { valid: boolean; error?: string } {
+  const rangeCheck = validatePortNumber('--max-port', maxPort);
+  if (!rangeCheck.valid || maxPort === undefined) {
+    return rangeCheck;
+  }
+
+  const startPort = effectivePreferredPort(preferredPort);
+  if (maxPort < startPort) {
     return {
       valid: false,
-      error: `--idle-grace must be at most ${MAX_IDLE_GRACE_SECONDS} seconds`,
+      error: `--max-port (${maxPort}) must not be below --port (${startPort})`,
     };
   }
 
   return { valid: true };
+}
+
+/**
+ * Validates a parsed `<seconds>` value for a `--idle-grace`/`--timeout`-shaped
+ * flag: a non-negative integer, capped at `maxSeconds`.
+ *
+ * `parseInt` turns a typo like `--idle-grace abc` or `--timeout abc` into
+ * `NaN`. Left unvalidated, that `NaN` reaches either a `>=` comparison in
+ * `ReviewLifecycle` (always `false`, so the review can never be reported
+ * terminal and the server never exits) or `setTimeout(fn, NaN)` (fires on
+ * the very next tick, so the review would be declared finished at once --
+ * indistinguishable from one that actually ran out of time). `maxSeconds` is
+ * the other half of the same concern: both flags multiply their value by
+ * 1000 for `setTimeout`, and above `MAX_IDLE_GRACE_SECONDS` /
+ * `MAX_TIMEOUT_SECONDS` that product overflows `setTimeout`'s 32-bit signed
+ * delay limit (2147483647 ms), so Node clamps the delay to 1 ms instead of
+ * throwing -- the same "fires almost immediately" failure as the `NaN` case.
+ * Reject both before they get that far.
+ */
+function validateDurationSeconds(
+  flagName: string,
+  value: number | undefined,
+  maxSeconds: number,
+): { valid: boolean; error?: string } {
+  if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+    return { valid: false, error: `${flagName} must be a non-negative integer` };
+  }
+
+  if (value !== undefined && value > maxSeconds) {
+    return { valid: false, error: `${flagName} must be at most ${maxSeconds} seconds` };
+  }
+
+  return { valid: true };
+}
+
+export function validateIdleGraceSeconds(value: number | undefined): {
+  valid: boolean;
+  error?: string;
+} {
+  return validateDurationSeconds('--idle-grace', value, MAX_IDLE_GRACE_SECONDS);
+}
+
+/** The lifecycle half of `startServer`'s options, as the review flags describe it. */
+export interface ReviewLifecycleOptions {
+  backgroundReview: boolean;
+  idleGraceMs?: number;
+  reviewTimeoutMs?: number;
+  cleanupGraceMs?: number;
+}
+
+/**
+ * Translate the review's duration flags into server options.
+ *
+ * Kept out of the command action so it can be exercised directly: the action itself cannot be
+ * imported, because `index.ts` exports nothing and parses at module scope, and a test that
+ * re-declares an equivalent command proves only that the test agrees with itself.
+ *
+ * An absent flag is omitted rather than passed as undefined, so the server's own defaults apply.
+ */
+export function reviewLifecycleOptions(flags: {
+  background: boolean;
+  idleGrace?: number;
+  timeout?: number;
+  cleanupGrace?: number;
+}): ReviewLifecycleOptions {
+  return {
+    backgroundReview: flags.background,
+    ...(flags.idleGrace === undefined ? {} : { idleGraceMs: flags.idleGrace * 1000 }),
+    ...(flags.timeout === undefined ? {} : { reviewTimeoutMs: flags.timeout * 1000 }),
+    ...(flags.cleanupGrace === undefined ? {} : { cleanupGraceMs: flags.cleanupGrace * 1000 }),
+  };
+}
+
+/**
+ * Largest `--cleanup-grace <seconds>` value whose millisecond form still fits `setTimeout`'s
+ * 32-bit signed delay limit -- see `validateDurationSeconds` for what happens above it.
+ */
+export const MAX_CLEANUP_GRACE_SECONDS = 2_147_483;
+
+export function validateCleanupGraceSeconds(value: number | undefined): {
+  valid: boolean;
+  error?: string;
+} {
+  return validateDurationSeconds('--cleanup-grace', value, MAX_CLEANUP_GRACE_SECONDS);
+}
+
+/**
+ * Largest `--timeout <seconds>` value whose millisecond form still fits `setTimeout`'s 32-bit
+ * signed delay limit. The same number as its siblings, kept separate because each documents its
+ * own flag's cap.
+ */
+export const MAX_TIMEOUT_SECONDS = 2_147_483;
+
+export function validateTimeoutSeconds(value: number | undefined): {
+  valid: boolean;
+  error?: string;
+} {
+  return validateDurationSeconds('--timeout', value, MAX_TIMEOUT_SECONDS);
 }
 
 export function validateDiffArguments(

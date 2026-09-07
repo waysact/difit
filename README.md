@@ -141,22 +141,27 @@ Stdin mode is selected with intent-first rules:
 
 ## ⚙️ CLI Options
 
-| Flag                     | Default         | Description                                                                                             |
-| ------------------------ | --------------- | ------------------------------------------------------------------------------------------------------- |
-| `<target>`               | HEAD            | Commit hash, tag, HEAD~n, branch, or special arguments                                                  |
-| `[compare-with]`         | -               | Optional second commit to compare with (shows diff between the two)                                     |
-| `--merge-base`           | false           | Resolve the base revision with `git merge-base` before diffing (Git revision mode only)                 |
-| `--pr <url>`             | -               | GitHub PR URL to review (e.g., https://github.com/owner/repo/pull/123)                                  |
-| `--comment <json>`       | -               | Inject initial comments (repeatable; accepts a JSON object or array)                                    |
-| `--port`                 | 4966            | Preferred port; falls back to +1 if occupied                                                            |
-| `--host`                 | 127.0.0.1       | Host address to bind server to (use 0.0.0.0 for external access)                                        |
-| `--no-open`              | false           | Don't automatically open browser                                                                        |
-| `--clean`                | false           | Clear all existing comments and viewed files on startup                                                 |
-| `--include-untracked`    | false           | Automatically include untracked files in diff (only with `.` or `working`)                              |
-| `--keep-alive`           | false           | Keep server running after browser disconnects (stop manually with Ctrl+C)                               |
-| `--idle-grace <seconds>` | 10              | Seconds with no connected browser before the review is treated as finished                              |
-| `--background`           | false           | Keep the server running in the background and output JSON connection info                               |
-| `--context <lines>`      | git default (3) | Limit surrounding context lines per change (`0` shows changes only; not available with `--pr` or stdin) |
+| Flag                      | Default         | Description                                                                                                        |
+| ------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `<target>`                | HEAD            | Commit hash, tag, HEAD~n, branch, or special arguments                                                             |
+| `[compare-with]`          | -               | Optional second commit to compare with (shows diff between the two)                                                |
+| `--merge-base`            | false           | Resolve the base revision with `git merge-base` before diffing (Git revision mode only)                            |
+| `--pr <url>`              | -               | GitHub PR URL to review (e.g., https://github.com/owner/repo/pull/123)                                             |
+| `--comment <json>`        | -               | Inject initial comments (repeatable; accepts a JSON object or array)                                               |
+| `--port`                  | 4966            | Preferred port; falls back to +1 if occupied                                                                       |
+| `--host`                  | 127.0.0.1       | Host address to bind server to (use 0.0.0.0 for external access)                                                   |
+| `--no-open`               | false           | Don't automatically open browser                                                                                   |
+| `--clean`                 | false           | Clear all existing comments and viewed files on startup                                                            |
+| `--include-untracked`     | false           | Automatically include untracked files in diff (only with `.` or `working`)                                         |
+| `--keep-alive`            | false           | Keep server running after browser disconnects (stop manually with Ctrl+C)                                          |
+| `--idle-grace <seconds>`  | 10              | Seconds with no connected browser before the review is treated as finished                                         |
+| `--timeout <seconds>`     | 3600            | Finish the review after N seconds, however it was launched (default: one hour)                                     |
+| `--cleanup-grace <secs>`  | 300             | Seconds a finished background review stays reachable for final processing                                          |
+| `--background`            | false           | Keep the server running in the background and print JSON connection info ([REST guide](docs/agent-review-rest.md)) |
+| `--context <lines>`       | git default (3) | Limit surrounding context lines per change (`0` shows changes only; not available with `--pr` or stdin)            |
+| `--max-port <port>`       | `--port` + 99   | Highest port the fallback search may try before it fails                                                           |
+| `--strict-port`           | false           | Fail immediately instead of trying the next port                                                                   |
+| `--public-url <template>` | -               | URL to report instead of the bound one; `{port}` is substituted once the port is known                             |
 
 ## 💬 Comment System
 
@@ -166,7 +171,7 @@ difit includes a review comment system that makes it easy to provide feedback to
 2. **Edit Comments**: Edit existing comments with the edit button
 3. **Generate Prompts**: Comments include a "Copy Prompt" button that formats the context for AI coding agents
 4. **Copy All**: Use "Copy All Prompt" to copy all comments in a structured format
-5. **Persistent Storage**: Comments are saved in browser localStorage per commit
+5. **Where comments live**: For the review difit was launched for, comments live in the server process for its lifetime and are read back with the comment CLI or over REST; the browser keeps only unsaved drafts. Other revision pairs browsed in the same page keep localStorage persistence per commit
 
 ### Comment Prompt Format
 
